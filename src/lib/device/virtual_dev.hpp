@@ -54,8 +54,8 @@ public:
         REGISTER_COUNTER(default_chunk_allocation_cnt, "default chunk allocation count");
         REGISTER_COUNTER(random_chunk_allocation_cnt,
                          "random chunk allocation count"); // ideally it should be zero for hdd
-        REGISTER_HISTOGRAM_WITH_CARDINALITY_REDUCTION(blk_alloc_latency, "Blk allocation latency", "blk_alloc_latency",
-                                                              {}, HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(blk_alloc_latency, "Blk allocation latency", "blk_alloc_latency", {},
+                           HistogramBucketsType(OpLatecyBuckets));
         register_me_to_farm();
     }
 
