@@ -133,11 +133,10 @@ retry:
             pkey = my_node->get_nth_key< K >(curr_idx, true);
             if (child_node->total_entries() != 0) {
                 ckey = child_node->get_last_key< K >();
-                if (!child_node->is_leaf()) {
-                    BT_NODE_DBG_ASSERT_EQ(ckey.compare(pkey), 0, my_node);
-                } else {
-                    BT_NODE_DBG_ASSERT_LE(ckey.compare(pkey), 0, my_node);
-                }
+                // For extent-based keys, extent mutations (split/merge) can change
+                // the child's last key to be smaller than the separator set at split
+                // time. The separator remains a valid upper bound for routing.
+                BT_NODE_DBG_ASSERT_LE(ckey.compare(pkey), 0, my_node);
             }
             // BT_NODE_DBG_ASSERT_EQ((is_range_put_req(req) || k.compare(pkey) <= 0), true, child_node);
         }
@@ -169,17 +168,168 @@ out:
 }
 
 template < typename K, typename V >
+btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node, BtreeRangePutRequest< K >& rpreq) {
+    // Guard: only compile body for extent key/value types (K has lba_start/end_lba/nlba, V has blkid).
+    // For non-extent types (e.g. test keys), this function is never called but may be instantiated.
+    if constexpr (requires(K k, V v) { k.lba_start(); k.end_lba(); k.nlba(); v.blkid(); }) {
+        auto const& working = rpreq.working_range();
+        auto const& new_start_key = s_cast< K const& >(working.start_key());
+        auto const& new_end_key = s_cast< K const& >(working.end_key());
+        auto const new_start = new_start_key.lba_start();
+        auto const new_end = new_end_key.lba_start(); // end_key's lba_start is the last lba in the range
+        auto const* new_val = s_cast< V const* >(rpreq.m_newval);
+        // The input range start is the original write start — used for blkid offset calculation
+        auto const& input_start_key = s_cast< K const& >(rpreq.input_range().start_key());
+        auto const range_start = input_start_key.lba_start();
+
+        // 1. Find overlapping entries. match_range searches by lba_start via compare(),
+        //    but an entry before start_idx may extend into our range.
+        uint32_t start_idx{0}, end_idx{0};
+        bool has_match = my_node->template match_range< K >(working, start_idx, end_idx);
+
+        // 2. Build replacement list
+        std::vector< std::pair< K, V > > replacements;
+        auto cursor = new_start;
+        uint32_t overlapping_count = has_match ? (end_idx - start_idx + 1) : 0;
+
+        if (has_match) {
+            for (uint32_t i = start_idx; i <= end_idx; ++i) {
+                K ekey = my_node->get_nth_key< K >(i, false);
+                V eval;
+                my_node->get_nth_value(i, &eval, false);
+
+                auto e_start = ekey.lba_start();
+                auto e_end = ekey.end_lba();
+                auto e_blkid = eval.blkid();
+
+                // a. Gap before this existing entry — fill with new data
+                if (e_start > cursor) {
+                    auto gap_nlba = static_cast< uint32_t >(e_start - cursor);
+                    auto gap_offset = static_cast< uint32_t >(cursor - range_start);
+                    BlkId gap_blkid{static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + gap_offset),
+                                    static_cast< homestore::blk_count_t >(gap_nlba), new_val->blkid().chunk_num()};
+                    replacements.emplace_back(K{cursor, gap_nlba}, V{gap_blkid});
+                    cursor = e_start;
+                }
+
+                // b. Left split — existing starts before our range
+                if (e_start < cursor) {
+                    auto left_nlba = static_cast< uint32_t >(cursor - e_start);
+                    BlkId left_blkid{e_blkid.blk_num(), static_cast< homestore::blk_count_t >(left_nlba),
+                                     e_blkid.chunk_num()};
+                    replacements.emplace_back(K{e_start, left_nlba}, V{left_blkid});
+                }
+
+                // c. Overlap region
+                auto overlap_start = std::max(cursor, e_start);
+                auto overlap_end = std::min(e_end, new_end);
+                if (overlap_start <= overlap_end) {
+                    auto overlap_nlba = static_cast< uint32_t >(overlap_end - overlap_start + 1);
+
+                    // Call filter callback — volume layer collects old blkid for freeing
+                    if (rpreq.m_filter_cb) {
+                        auto old_offset = static_cast< uint32_t >(overlap_start - e_start);
+                        BlkId old_blkid{static_cast< homestore::blk_num_t >(e_blkid.blk_num() + old_offset),
+                                        static_cast< homestore::blk_count_t >(overlap_nlba), e_blkid.chunk_num()};
+                        K overlap_key{overlap_start, overlap_nlba};
+                        V overlap_val{old_blkid};
+                        rpreq.m_filter_cb(overlap_key, overlap_val, *new_val);
+                    }
+
+                    // Insert new data for the overlap region
+                    auto new_offset = static_cast< uint32_t >(overlap_start - range_start);
+                    BlkId new_blkid{static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + new_offset),
+                                    static_cast< homestore::blk_count_t >(overlap_nlba),
+                                    new_val->blkid().chunk_num()};
+                    replacements.emplace_back(K{overlap_start, overlap_nlba}, V{new_blkid});
+                }
+
+                // d. Right split — existing extends past our range
+                if (e_end > new_end) {
+                    auto right_start = new_end + 1;
+                    auto right_nlba = static_cast< uint32_t >(e_end - new_end);
+                    auto right_offset = static_cast< uint32_t >(right_start - e_start);
+                    BlkId right_blkid{static_cast< homestore::blk_num_t >(e_blkid.blk_num() + right_offset),
+                                      static_cast< homestore::blk_count_t >(right_nlba), e_blkid.chunk_num()};
+                    replacements.emplace_back(K{right_start, right_nlba}, V{right_blkid});
+                }
+
+                cursor = std::max(overlap_end, e_end) + 1;
+            }
+        }
+
+        // e. Trailing gap — remaining new range after all existing entries
+        if (cursor <= new_end) {
+            auto gap_nlba = static_cast< uint32_t >(new_end - cursor + 1);
+            auto gap_offset = static_cast< uint32_t >(cursor - range_start);
+            BlkId gap_blkid{static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + gap_offset),
+                            static_cast< homestore::blk_count_t >(gap_nlba), new_val->blkid().chunk_num()};
+            replacements.emplace_back(K{cursor, gap_nlba}, V{gap_blkid});
+        }
+
+        // 3. Check space: we need room for net new entries
+        int32_t net_new = static_cast< int32_t >(replacements.size()) - static_cast< int32_t >(overlapping_count);
+        if (net_new > 0) {
+            for (int32_t n = 0; n < net_new; ++n) {
+                if (!my_node->has_room_for_put(btree_put_type::INSERT, K::get_fixed_size(), V::get_fixed_size())) {
+                    // Not enough room — return has_more so the btree splits and retries
+                    if (replacements.size() > 0) {
+                        // Set the working range to start from the first replacement we couldn't insert
+                        K failed_key = replacements[0].first;
+                        rpreq.shift_working_range(std::move(failed_key), true);
+                    }
+                    return btree_status_t::has_more;
+                }
+            }
+        }
+
+        // 4. Remove old entries, insert replacements at the same position.
+        //    We use positional insert (insert(idx, key, val)) instead of
+        //    insert(key, val) because the latter calls find() which uses the
+        //    interval comparator and may incorrectly report a "duplicate" when
+        //    inserting adjacent non-overlapping extents.
+        if (overlapping_count > 0) {
+            COUNTER_DECREMENT(m_metrics, btree_obj_count, overlapping_count);
+            my_node->remove(start_idx, end_idx);
+        }
+        uint32_t insert_pos = start_idx;
+        for (auto const& [k, v] : replacements) {
+            auto status = my_node->insert(insert_pos, k, v);
+            BT_NODE_REL_ASSERT((status == btree_status_t::success), my_node,
+                               "unexpected insert failure in extent mutation");
+            COUNTER_INCREMENT(m_metrics, btree_obj_count, 1);
+            ++insert_pos;
+        }
+
+        // 5. Advance range cursor
+        rpreq.shift_working_range();
+        return btree_status_t::success;
+    } else {
+        // Non-extent types should never reach here
+        DEBUG_ASSERT(false, "mutate_extents_in_leaf called for non-extent key type");
+        return btree_status_t::not_found;
+    }
+}
+
+template < typename K, typename V >
 template < typename ReqT >
 btree_status_t Btree< K, V >::mutate_write_leaf_node(const BtreeNodePtr& my_node, ReqT& req) {
     btree_status_t ret = btree_status_t::success;
     if constexpr (std::is_same_v< ReqT, BtreeRangePutRequest< K > >) {
-        K last_failed_key;
-        ret = to_variant_node(my_node)->multi_put(req.working_range(), req.input_range().start_key(), *req.m_newval,
-                                                  req.m_put_type, &last_failed_key, req.m_filter_cb, req.m_app_context);
-        if (ret == btree_status_t::has_more) {
-            req.shift_working_range(std::move(last_failed_key), true /* make it including last_failed_key */);
-        } else if (ret == btree_status_t::success) {
-            req.shift_working_range();
+        if constexpr (requires(K k) { k.lba_start(); k.end_lba(); k.nlba(); }) {
+            // Extent path — mutate_extents_in_leaf handles overlapping extents with splits
+            ret = mutate_extents_in_leaf(my_node, req);
+        } else {
+            // Default path — multi_put for interval keys (prefix) and fixed keys (range update)
+            K last_failed_key;
+            ret = to_variant_node(my_node)->multi_put(req.working_range(), req.input_range().start_key(), *req.m_newval,
+                                                      req.m_put_type, &last_failed_key, req.m_filter_cb,
+                                                      req.m_app_context);
+            if (ret == btree_status_t::has_more) {
+                req.shift_working_range(std::move(last_failed_key), true /* make it including last_failed_key */);
+            } else if (ret == btree_status_t::success) {
+                req.shift_working_range();
+            }
         }
     } else if constexpr (std::is_same_v< ReqT, BtreeSinglePutRequest >) {
         ret =
