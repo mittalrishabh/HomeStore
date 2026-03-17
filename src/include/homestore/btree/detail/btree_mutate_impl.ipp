@@ -197,20 +197,31 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
         uint32_t start_idx{0}, end_idx{0};
         bool has_match = my_node->template match_range< K >(search_range, start_idx, end_idx);
 
-        // 2. Build replacement list: trim start, trim end, replace middle
-        std::vector< std::pair< K, V > > replacements;
+        // 2. Build replacement list on the stack (max 3: left trim + new extent + right trim).
+        std::array< std::pair< K, V >, 3 > replacements;
+        uint32_t num_replacements{0};
         uint32_t overlapping_count = has_match ? (end_idx - start_idx + 1) : 0;
 
+        // Read first/last overlapping entries once — reused for trim and filter callback.
+        K first_key{}, last_key{};
+        V first_val{}, last_val{};
         if (has_match) {
-            // a. Trim first entry — if it starts before our range, keep left portion
-            K first_key = my_node->get_nth_key< K >(start_idx, false);
-            V first_val;
+            first_key = my_node->get_nth_key< K >(start_idx, false);
             my_node->get_nth_value(start_idx, &first_val, false);
+            if (start_idx != end_idx) {
+                last_key = my_node->get_nth_key< K >(end_idx, false);
+                my_node->get_nth_value(end_idx, &last_val, false);
+            } else {
+                last_key = first_key;
+                last_val = first_val;
+            }
+
+            // a. Trim first entry — if it starts before our range, keep left portion
             if (first_key.lba_start() < new_start) {
                 auto left_nlba = static_cast< uint32_t >(new_start - first_key.lba_start());
                 BlkId left_blkid(first_val.blkid().blk_num(), static_cast< homestore::blk_count_t >(left_nlba),
                                  first_val.blkid().chunk_num());
-                replacements.emplace_back(K{first_key.lba_start(), left_nlba}, V{left_blkid});
+                replacements[num_replacements++] = {K{first_key.lba_start(), left_nlba}, V{left_blkid}};
             }
 
             // b. New extent — the write range
@@ -218,19 +229,16 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
             auto new_offset = static_cast< uint32_t >(new_start - range_start);
             BlkId new_blkid(static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + new_offset),
                             static_cast< homestore::blk_count_t >(new_nlba), new_val->blkid().chunk_num());
-            replacements.emplace_back(K{new_start, new_nlba}, V{new_blkid});
+            replacements[num_replacements++] = {K{new_start, new_nlba}, V{new_blkid}};
 
-            // d. Trim last entry — if it extends past our range, keep right portion
-            K last_key = my_node->get_nth_key< K >(end_idx, false);
-            V last_val;
-            my_node->get_nth_value(end_idx, &last_val, false);
+            // c. Trim last entry — if it extends past our range, keep right portion
             if (last_key.end_lba() > new_end) {
                 auto right_start = new_end + 1;
                 auto right_nlba = static_cast< uint32_t >(last_key.end_lba() - new_end);
                 auto right_offset = static_cast< uint32_t >(right_start - last_key.lba_start());
                 BlkId right_blkid(static_cast< homestore::blk_num_t >(last_val.blkid().blk_num() + right_offset),
                                   static_cast< homestore::blk_count_t >(right_nlba), last_val.blkid().chunk_num());
-                replacements.emplace_back(K{right_start, right_nlba}, V{right_blkid});
+                replacements[num_replacements++] = {K{right_start, right_nlba}, V{right_blkid}};
             }
         } else {
             // No overlapping entries — just insert the new extent
@@ -238,28 +246,28 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
             auto new_offset = static_cast< uint32_t >(new_start - range_start);
             BlkId new_blkid(static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + new_offset),
                             static_cast< homestore::blk_count_t >(new_nlba), new_val->blkid().chunk_num());
-            replacements.emplace_back(K{new_start, new_nlba}, V{new_blkid});
+            replacements[num_replacements++] = {K{new_start, new_nlba}, V{new_blkid}};
         }
 
         // 3. Check space: we need room for net new entries.
-        // available_size() returns bytes free in the node; each entry takes key_size + value_size.
-        int32_t net_new = static_cast< int32_t >(replacements.size()) - static_cast< int32_t >(overlapping_count);
+        int32_t net_new = static_cast< int32_t >(num_replacements) - static_cast< int32_t >(overlapping_count);
         if (net_new > 0) {
             uint32_t entry_size = K::get_fixed_size() + V::get_fixed_size();
             if (my_node->available_size() < static_cast< uint32_t >(net_new) * entry_size) {
-                // Not enough room — return has_more so the btree splits and retries
                 rpreq.shift_working_range(K{new_start, 1}, true);
                 return btree_status_t::has_more;
             }
         }
 
         // 4. Filter callback — notify volume layer of overwritten blkids for freeing.
-        // Must be after space check so we don't fire callbacks then return has_more (causing duplicate frees on retry).
+        // Reuses first_key/first_val/last_key/last_val already read above; only re-reads middle entries.
         if (has_match && rpreq.m_filter_cb) {
             for (uint32_t i = start_idx; i <= end_idx; ++i) {
-                K ekey = my_node->get_nth_key< K >(i, false);
+                K ekey;
                 V eval;
-                my_node->get_nth_value(i, &eval, false);
+                if (i == start_idx) { ekey = first_key; eval = first_val; }
+                else if (i == end_idx) { ekey = last_key; eval = last_val; }
+                else { ekey = my_node->get_nth_key< K >(i, false); my_node->get_nth_value(i, &eval, false); }
                 auto overlap_start = std::max(new_start, ekey.lba_start());
                 auto overlap_end = std::min(new_end, ekey.end_lba());
                 if (overlap_start <= overlap_end) {
@@ -273,16 +281,14 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
             }
         }
 
-        // 5. Remove old entries, insert replacements via binary search.
+        // 5. Remove old entries, insert replacements at known position (no binary search).
         if (overlapping_count > 0) {
             COUNTER_DECREMENT(m_metrics, btree_obj_count, overlapping_count);
             my_node->remove(start_idx, end_idx);
         }
 
-        for (auto const& [k, v] : replacements) {
-            auto status = my_node->insert(k, v);
-            BT_NODE_REL_ASSERT((status == btree_status_t::success), my_node,
-                               "unexpected insert failure in extent mutation, key=[{},{}]", k.lba_start(), k.end_lba());
+        for (uint32_t i = 0; i < num_replacements; ++i) {
+            my_node->insert(start_idx + i, replacements[i].first, replacements[i].second);
             COUNTER_INCREMENT(m_metrics, btree_obj_count, 1);
         }
 
