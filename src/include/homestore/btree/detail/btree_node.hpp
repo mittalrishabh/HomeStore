@@ -196,6 +196,18 @@ public:
             sfound = false;
         }
 
+        // For extent keys on leaf nodes, bsearch may miss an entry just before start_idx
+        // whose end_lba extends into our range. Check one entry back.
+        if constexpr (requires(K k) { k.end_lba(); }) {
+            if (is_leaf() && start_idx > 0) {
+                K prev_key = get_nth_key< K >(start_idx - 1, false);
+                if (prev_key.end_lba() >= s_cast< K const& >(range.start_key()).lba_start()) {
+                    --start_idx;
+                    sfound = true;
+                }
+            }
+        }
+
         if (start_idx == this->total_entries()) {
             // We are already at the end of search, we should return this as the only entry
             end_idx = start_idx;

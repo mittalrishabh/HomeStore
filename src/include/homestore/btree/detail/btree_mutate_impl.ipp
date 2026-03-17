@@ -172,136 +172,145 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
     // Guard: only compile body for extent key/value types (K has lba_start/end_lba/nlba, V has blkid).
     // For non-extent types (e.g. test keys), this function is never called but may be instantiated.
     if constexpr (requires(K k, V v) { k.lba_start(); k.end_lba(); k.nlba(); v.blkid(); }) {
-        auto const& working = rpreq.working_range();
-        auto const& new_start_key = s_cast< K const& >(working.start_key());
-        auto const& new_end_key = s_cast< K const& >(working.end_key());
-        auto const new_start = new_start_key.lba_start();
-        auto const new_end = new_end_key.lba_start(); // end_key's lba_start is the last lba in the range
+        auto const working = rpreq.working_range();
+        auto const new_start_key = s_cast< K const& >(working.start_key());
+        auto const new_end_key = s_cast< K const& >(working.end_key());
+        // When start_inclusive is false, the working range start key is the separator from the previous
+        // child — we already wrote up to its end_lba, so we must begin at end_lba + 1 to avoid overlap.
+        auto const new_start = working.is_start_inclusive() ? new_start_key.lba_start()
+                                                           : new_start_key.end_lba() + 1;
+        auto const new_end = new_end_key.end_lba(); // Use end_lba() since trimmed keys may have nlba > 1
         auto const* new_val = s_cast< V const* >(rpreq.m_newval);
         // The input range start is the original write start — used for blkid offset calculation
-        auto const& input_start_key = s_cast< K const& >(rpreq.input_range().start_key());
+        auto const input_start_key = s_cast< K const& >(rpreq.input_range().start_key());
         auto const range_start = input_start_key.lba_start();
 
-        // 1. Find overlapping entries. match_range searches by lba_start via compare(),
-        //    but an entry before start_idx may extend into our range.
-        uint32_t start_idx{0}, end_idx{0};
-        bool has_match = my_node->template match_range< K >(working, start_idx, end_idx);
+        DEBUG_ASSERT_LE(new_start, new_end,
+                        "adjusted start {} past end {} — separator end_lba should not exceed write range",
+                        new_start, new_end);
 
-        // 2. Build replacement list
+        // 1. Find overlapping entries using the adjusted LBA range.
+        // When start_inclusive was false (cross-child continuation), the working range start key
+        // covers the separator LBA, not our actual write start. Use adjusted keys for match_range
+        // so we correctly find all entries overlapping with [new_start, new_end].
+        BtreeKeyRange< K > search_range{K{new_start, 1}, true, K{new_end, 1}, true};
+        uint32_t start_idx{0}, end_idx{0};
+        bool has_match = my_node->template match_range< K >(search_range, start_idx, end_idx);
+
+        // 2. Build replacement list: trim start, trim end, replace middle
         std::vector< std::pair< K, V > > replacements;
-        auto cursor = new_start;
         uint32_t overlapping_count = has_match ? (end_idx - start_idx + 1) : 0;
 
         if (has_match) {
+            // a. Trim first entry — if it starts before our range, keep left portion
+            K first_key = my_node->get_nth_key< K >(start_idx, false);
+            V first_val;
+            my_node->get_nth_value(start_idx, &first_val, false);
+            if (first_key.lba_start() < new_start) {
+                auto left_nlba = static_cast< uint32_t >(new_start - first_key.lba_start());
+                BlkId left_blkid(first_val.blkid().blk_num(), static_cast< homestore::blk_count_t >(left_nlba),
+                                 first_val.blkid().chunk_num());
+                replacements.emplace_back(K{first_key.lba_start(), left_nlba}, V{left_blkid});
+            }
+
+            // b. New extent — the write range
+            auto new_nlba = static_cast< uint32_t >(new_end - new_start + 1);
+            auto new_offset = static_cast< uint32_t >(new_start - range_start);
+            BlkId new_blkid(static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + new_offset),
+                            static_cast< homestore::blk_count_t >(new_nlba), new_val->blkid().chunk_num());
+            replacements.emplace_back(K{new_start, new_nlba}, V{new_blkid});
+
+            // d. Trim last entry — if it extends past our range, keep right portion
+            K last_key = my_node->get_nth_key< K >(end_idx, false);
+            V last_val;
+            my_node->get_nth_value(end_idx, &last_val, false);
+            if (last_key.end_lba() > new_end) {
+                auto right_start = new_end + 1;
+                auto right_nlba = static_cast< uint32_t >(last_key.end_lba() - new_end);
+                auto right_offset = static_cast< uint32_t >(right_start - last_key.lba_start());
+                BlkId right_blkid(static_cast< homestore::blk_num_t >(last_val.blkid().blk_num() + right_offset),
+                                  static_cast< homestore::blk_count_t >(right_nlba), last_val.blkid().chunk_num());
+                replacements.emplace_back(K{right_start, right_nlba}, V{right_blkid});
+            }
+        } else {
+            // No overlapping entries — just insert the new extent
+            auto new_nlba = static_cast< uint32_t >(new_end - new_start + 1);
+            auto new_offset = static_cast< uint32_t >(new_start - range_start);
+            BlkId new_blkid(static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + new_offset),
+                            static_cast< homestore::blk_count_t >(new_nlba), new_val->blkid().chunk_num());
+            replacements.emplace_back(K{new_start, new_nlba}, V{new_blkid});
+        }
+
+        // 3. Check space: we need room for net new entries.
+        // available_size() returns bytes free in the node; each entry takes key_size + value_size.
+        int32_t net_new = static_cast< int32_t >(replacements.size()) - static_cast< int32_t >(overlapping_count);
+        if (net_new > 0) {
+            uint32_t entry_size = K::get_fixed_size() + V::get_fixed_size();
+            if (my_node->available_size() < static_cast< uint32_t >(net_new) * entry_size) {
+                // Not enough room — return has_more so the btree splits and retries
+                rpreq.shift_working_range(K{new_start, 1}, true);
+                return btree_status_t::has_more;
+            }
+        }
+
+        // 4. Filter callback — notify volume layer of overwritten blkids for freeing.
+        // Must be after space check so we don't fire callbacks then return has_more (causing duplicate frees on retry).
+        if (has_match && rpreq.m_filter_cb) {
             for (uint32_t i = start_idx; i <= end_idx; ++i) {
                 K ekey = my_node->get_nth_key< K >(i, false);
                 V eval;
                 my_node->get_nth_value(i, &eval, false);
-
-                auto e_start = ekey.lba_start();
-                auto e_end = ekey.end_lba();
-                auto e_blkid = eval.blkid();
-
-                // a. Gap before this existing entry — fill with new data
-                if (e_start > cursor) {
-                    auto gap_nlba = static_cast< uint32_t >(e_start - cursor);
-                    auto gap_offset = static_cast< uint32_t >(cursor - range_start);
-                    BlkId gap_blkid{static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + gap_offset),
-                                    static_cast< homestore::blk_count_t >(gap_nlba), new_val->blkid().chunk_num()};
-                    replacements.emplace_back(K{cursor, gap_nlba}, V{gap_blkid});
-                    cursor = e_start;
-                }
-
-                // b. Left split — existing starts before our range
-                if (e_start < cursor) {
-                    auto left_nlba = static_cast< uint32_t >(cursor - e_start);
-                    BlkId left_blkid{e_blkid.blk_num(), static_cast< homestore::blk_count_t >(left_nlba),
-                                     e_blkid.chunk_num()};
-                    replacements.emplace_back(K{e_start, left_nlba}, V{left_blkid});
-                }
-
-                // c. Overlap region
-                auto overlap_start = std::max(cursor, e_start);
-                auto overlap_end = std::min(e_end, new_end);
+                auto overlap_start = std::max(new_start, ekey.lba_start());
+                auto overlap_end = std::min(new_end, ekey.end_lba());
                 if (overlap_start <= overlap_end) {
                     auto overlap_nlba = static_cast< uint32_t >(overlap_end - overlap_start + 1);
-
-                    // Call filter callback — volume layer collects old blkid for freeing
-                    if (rpreq.m_filter_cb) {
-                        auto old_offset = static_cast< uint32_t >(overlap_start - e_start);
-                        BlkId old_blkid{static_cast< homestore::blk_num_t >(e_blkid.blk_num() + old_offset),
-                                        static_cast< homestore::blk_count_t >(overlap_nlba), e_blkid.chunk_num()};
-                        K overlap_key{overlap_start, overlap_nlba};
-                        V overlap_val{old_blkid};
-                        rpreq.m_filter_cb(overlap_key, overlap_val, *new_val);
-                    }
-
-                    // Insert new data for the overlap region
-                    auto new_offset = static_cast< uint32_t >(overlap_start - range_start);
-                    BlkId new_blkid{static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + new_offset),
+                    auto old_offset = static_cast< uint32_t >(overlap_start - ekey.lba_start());
+                    BlkId old_blkid(static_cast< homestore::blk_num_t >(eval.blkid().blk_num() + old_offset),
                                     static_cast< homestore::blk_count_t >(overlap_nlba),
-                                    new_val->blkid().chunk_num()};
-                    replacements.emplace_back(K{overlap_start, overlap_nlba}, V{new_blkid});
-                }
-
-                // d. Right split — existing extends past our range
-                if (e_end > new_end) {
-                    auto right_start = new_end + 1;
-                    auto right_nlba = static_cast< uint32_t >(e_end - new_end);
-                    auto right_offset = static_cast< uint32_t >(right_start - e_start);
-                    BlkId right_blkid{static_cast< homestore::blk_num_t >(e_blkid.blk_num() + right_offset),
-                                      static_cast< homestore::blk_count_t >(right_nlba), e_blkid.chunk_num()};
-                    replacements.emplace_back(K{right_start, right_nlba}, V{right_blkid});
-                }
-
-                cursor = std::max(overlap_end, e_end) + 1;
-            }
-        }
-
-        // e. Trailing gap — remaining new range after all existing entries
-        if (cursor <= new_end) {
-            auto gap_nlba = static_cast< uint32_t >(new_end - cursor + 1);
-            auto gap_offset = static_cast< uint32_t >(cursor - range_start);
-            BlkId gap_blkid{static_cast< homestore::blk_num_t >(new_val->blkid().blk_num() + gap_offset),
-                            static_cast< homestore::blk_count_t >(gap_nlba), new_val->blkid().chunk_num()};
-            replacements.emplace_back(K{cursor, gap_nlba}, V{gap_blkid});
-        }
-
-        // 3. Check space: we need room for net new entries
-        int32_t net_new = static_cast< int32_t >(replacements.size()) - static_cast< int32_t >(overlapping_count);
-        if (net_new > 0) {
-            for (int32_t n = 0; n < net_new; ++n) {
-                if (!my_node->has_room_for_put(btree_put_type::INSERT, K::get_fixed_size(), V::get_fixed_size())) {
-                    // Not enough room — return has_more so the btree splits and retries
-                    if (replacements.size() > 0) {
-                        // Set the working range to start from the first replacement we couldn't insert
-                        K failed_key = replacements[0].first;
-                        rpreq.shift_working_range(std::move(failed_key), true);
-                    }
-                    return btree_status_t::has_more;
+                                    eval.blkid().chunk_num());
+                    rpreq.m_filter_cb(K{overlap_start, overlap_nlba}, V{old_blkid}, *new_val);
                 }
             }
         }
 
-        // 4. Remove old entries, insert replacements at the same position.
-        //    We use positional insert (insert(idx, key, val)) instead of
-        //    insert(key, val) because the latter calls find() which uses the
-        //    interval comparator and may incorrectly report a "duplicate" when
-        //    inserting adjacent non-overlapping extents.
+        // 5. Remove old entries, insert replacements via binary search.
         if (overlapping_count > 0) {
             COUNTER_DECREMENT(m_metrics, btree_obj_count, overlapping_count);
             my_node->remove(start_idx, end_idx);
         }
-        uint32_t insert_pos = start_idx;
+
         for (auto const& [k, v] : replacements) {
-            auto status = my_node->insert(insert_pos, k, v);
+            auto status = my_node->insert(k, v);
             BT_NODE_REL_ASSERT((status == btree_status_t::success), my_node,
-                               "unexpected insert failure in extent mutation");
+                               "unexpected insert failure in extent mutation, key=[{},{}]", k.lba_start(), k.end_lba());
             COUNTER_INCREMENT(m_metrics, btree_obj_count, 1);
-            ++insert_pos;
         }
 
-        // 5. Advance range cursor
+        // 6. Validate node: no overlapping entries, sorted, valid blkids
+#ifndef NDEBUG
+        {
+            auto const total = my_node->total_entries();
+            for (uint32_t i = 0; i < total; ++i) {
+                K ki = my_node->get_nth_key< K >(i, false);
+                V vi;
+                my_node->get_nth_value(i, &vi, false);
+                DEBUG_ASSERT_GT(ki.nlba(), 0, "entry {} has zero nlba: lba_start={}", i, ki.lba_start());
+                DEBUG_ASSERT_GT(vi.blkid().blk_count(), 0, "entry {} has zero blk_count: lba_start={}", i,
+                                ki.lba_start());
+                DEBUG_ASSERT_EQ(ki.nlba(), vi.blkid().blk_count(),
+                                "entry {} nlba/blk_count mismatch: lba=[{},{}] blk_num={} blk_count={}", i,
+                                ki.lba_start(), ki.end_lba(), vi.blkid().blk_num(), vi.blkid().blk_count());
+                if (i + 1 < total) {
+                    K kn = my_node->get_nth_key< K >(i + 1, false);
+                    DEBUG_ASSERT_LE(ki.end_lba() + 1, kn.lba_start(),
+                                    "entries {} and {} overlap or out of order: [{},{}] vs [{},{}]", i, i + 1,
+                                    ki.lba_start(), ki.end_lba(), kn.lba_start(), kn.end_lba());
+                }
+            }
+        }
+#endif
+
+        // 7. Advance range cursor
         rpreq.shift_working_range();
         return btree_status_t::success;
     } else {
@@ -459,6 +468,12 @@ bool Btree< K, V >::is_split_needed(const BtreeNodePtr& node, ReqT& req) const {
     if (!node->is_leaf()) { // if internal node, size is atmost one additional entry, size of K/V
         return !node->has_room_for_put(btree_put_type::UPSERT, K::get_max_size(), BtreeLinkInfo::get_fixed_size());
     } else if constexpr (std::is_same_v< ReqT, BtreeRangePutRequest< K > >) {
+        // For extent keys, mutate_extents_in_leaf may produce up to 3 entries
+        // (left trim + new extent + right trim). Ensure room for at least 3.
+        if constexpr (requires(K k) { k.lba_start(); k.end_lba(); k.nlba(); }) {
+            uint32_t entry_size = K::get_fixed_size() + V::get_fixed_size();
+            return node->available_size() < 3 * entry_size;
+        }
         return !node->has_room_for_put(req.m_put_type, req.first_key_size(), req.m_newval->serialized_size());
     } else if constexpr (std::is_same_v< ReqT, BtreeSinglePutRequest >) {
         return !node->has_room_for_put(req.m_put_type, req.key().serialized_size(), req.value().serialized_size());
