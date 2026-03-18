@@ -102,7 +102,7 @@ std::error_code SoloReplDev::alloc_blks(uint32_t data_size, const blk_alloc_hint
     auto status =
         data_service().alloc_blks(sisl::round_up(uint32_cast(data_size), data_service().get_blk_size()), hints, blkids);
     if (status != BlkAllocStatus::SUCCESS) {
-        DEBUG_ASSERT_EQ(status, BlkAllocStatus::SUCCESS, "Unable to allocate blks");
+        LOGERROR("Block allocation failed with status={}, returning ENOSPC", static_cast< int >(status));
         decr_pending_request_num();
         return std::make_error_code(std::errc::no_space_on_device);
     }

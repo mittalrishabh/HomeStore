@@ -172,6 +172,7 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
     // Guard: only compile body for extent key/value types (K has lba_start/end_lba/nlba, V has blkid).
     // For non-extent types (e.g. test keys), this function is never called but may be instantiated.
     if constexpr (requires(K k, V v) { k.lba_start(); k.end_lba(); k.nlba(); v.blkid(); }) {
+        auto const mutate_start_time = Clock::now();
         auto const working = rpreq.working_range();
         auto const new_start_key = s_cast< K const& >(working.start_key());
         auto const new_end_key = s_cast< K const& >(working.end_key());
@@ -282,6 +283,7 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
         }
 
         // 5. Remove old entries, insert replacements at known position (no binary search).
+        auto const remove_insert_start_time = Clock::now();
         if (overlapping_count > 0) {
             COUNTER_DECREMENT(m_metrics, btree_obj_count, overlapping_count);
             my_node->remove(start_idx, end_idx);
@@ -291,6 +293,7 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
             my_node->insert(start_idx + i, replacements[i].first, replacements[i].second);
             COUNTER_INCREMENT(m_metrics, btree_obj_count, 1);
         }
+        HISTOGRAM_OBSERVE(m_metrics, btree_extent_remove_insert_latency, get_elapsed_time_ns(remove_insert_start_time));
 
         // 6. Validate node: no overlapping entries, sorted, valid blkids
 #ifndef NDEBUG
@@ -317,6 +320,7 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
 #endif
 
         // 7. Advance range cursor
+        HISTOGRAM_OBSERVE(m_metrics, btree_mutate_extents_latency, get_elapsed_time_ns(mutate_start_time));
         rpreq.shift_working_range();
         return btree_status_t::success;
     } else {

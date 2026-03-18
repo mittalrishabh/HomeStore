@@ -335,6 +335,13 @@ public:
         REGISTER_HISTOGRAM(btree_inclusive_time_in_leaf_node, "Inclusive time spent (Read locked) on leaf node (ns)",
                            "btree_inclusive_time_in_node", {"node_type", "leaf"},
                            HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(btree_mutate_extents_latency, "Latency of mutate_extents_in_leaf (ns)",
+                           HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(btree_extent_remove_insert_latency,
+                           "Latency of remove + insert in extent mutation (ns)",
+                           HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(btree_write_node_latency, "Latency of write_node (wb cache update) (ns)",
+                           HistogramBucketsType(OpLatecyBuckets));
 
         register_me_to_farm();
     }

@@ -94,7 +94,10 @@ btree_status_t Btree< K, V >::write_node(const BtreeNodePtr& node, void* context
     HISTOGRAM_OBSERVE_IF_ELSE(m_metrics, node->is_leaf(), btree_leaf_node_occupancy, btree_int_node_occupancy,
                               ((m_node_size - node->available_size()) * 100) / m_node_size);
 
-    return (write_node_impl(node, context));
+    auto const start = Clock::now();
+    auto ret = write_node_impl(node, context);
+    HISTOGRAM_OBSERVE(m_metrics, btree_write_node_latency, get_elapsed_time_ns(start));
+    return ret;
 }
 
 /* Caller of this api doesn't expect read to fail in any circumstance */
