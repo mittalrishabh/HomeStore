@@ -74,6 +74,7 @@ if((${CMAKE_CXX_COMPILER_ID} STREQUAL "GNU") OR (${CMAKE_CXX_COMPILER_ID} STREQU
 
     # Allow deprecated C++
     add_flags("-fpermissive")
+
 endif()
 
 # add boost options

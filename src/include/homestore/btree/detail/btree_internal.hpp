@@ -192,7 +192,7 @@ namespace homestore {
 
 using bnodeid_t = uint64_t;
 static constexpr bnodeid_t empty_bnodeid = std::numeric_limits< bnodeid_t >::max();
-static constexpr uint16_t bt_init_crc_16 = 0x8005;
+static constexpr uint32_t bt_init_crc32c = 0;
 
 VENUM(btree_node_type, uint32_t, FIXED = 0, VAR_VALUE = 1, VAR_KEY = 2, VAR_OBJECT = 3, PREFIX = 4, COMPACT = 5)
 

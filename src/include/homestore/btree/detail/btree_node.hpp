@@ -25,6 +25,7 @@
 #include "btree_internal.hpp"
 #include <homestore/btree/btree_kv.hpp>
 #include <homestore/crc.h>
+#include <homestore/btree/detail/btree_crc32c.hpp>
 
 namespace homestore {
 ENUM(locktype_t, uint8_t, NONE, READ, WRITE)
@@ -50,24 +51,24 @@ static constexpr uint8_t BTREE_NODE_MAGIC = 0xab;
 struct persistent_hdr_t {
     uint8_t magic{BTREE_NODE_MAGIC};     // offset=0
     uint8_t version{BTREE_NODE_VERSION}; // offset=1
-    uint16_t checksum{0};                // offset=2
+    uint32_t checksum{0};                // offset=2
 
-    uint32_t nentries : 30; // offset 4
+    uint32_t nentries : 30; // offset=6
     uint32_t leaf : 1;
     uint32_t node_deleted : 1;
 
-    bnodeid_t node_id{empty_bnodeid};   // offset=8
-    bnodeid_t next_node{empty_bnodeid}; // offset=16
+    bnodeid_t node_id{empty_bnodeid};   // offset=10
+    bnodeid_t next_node{empty_bnodeid}; // offset=18
 
-    uint64_t node_gen{0};     // offset=24: Generation of this node, incremented on every update
-    uint64_t link_version{0}; // offset=32: Version of the link between its parent, updated if structure changes
-    BtreeLinkInfo::bnode_link_info edge_info; // offset=40: Edge entry information
+    uint64_t node_gen{0};     // offset=26: Generation of this node, incremented on every update
+    uint64_t link_version{0}; // offset=34: Version of the link between its parent, updated if structure changes
+    BtreeLinkInfo::bnode_link_info edge_info; // offset=42: Edge entry information
 
-    int64_t modified_cp_id{-1};   // offset=56: Checkpoint ID of the last modification of this node
-    uint16_t level;               // offset=64: Level of the node within the tree
-    uint16_t node_size;           // offset=66: Size of node, max 64K
-    uint8_t node_type;            // offset=68: Type of the node (simple vs varlen etc..)
-    uint8_t reserved[3]{0, 0, 0}; // offset=69-72: Reserved
+    int64_t modified_cp_id{-1};   // offset=58: Checkpoint ID of the last modification of this node
+    uint16_t level;               // offset=66: Level of the node within the tree
+    uint16_t node_size;           // offset=68: Size of node, max 64K
+    uint8_t node_type;            // offset=70: Type of the node (simple vs varlen etc..)
+    uint8_t reserved[3]{0, 0, 0}; // offset=71-74: Reserved
 
     persistent_hdr_t() : nentries{0}, leaf{0}, node_deleted{0} {}
     std::string to_string() const {
@@ -135,8 +136,8 @@ public:
         if ((uint32_cast(phdr->node_size) + 1) != buf.size()) { return false; }
         if (phdr->node_id == empty_bnodeid) { return false; }
 
-        auto const exp_checksum = crc16_t10dif(bt_init_crc_16, (buf.cbytes() + sizeof(persistent_hdr_t)),
-                                               buf.size() - sizeof(persistent_hdr_t));
+        auto const exp_checksum = bt_crc32c(bt_init_crc32c, (buf.cbytes() + sizeof(persistent_hdr_t)),
+                                           buf.size() - sizeof(persistent_hdr_t));
         if (phdr->checksum != exp_checksum) { return false; }
 
         return true;
@@ -508,18 +509,18 @@ public:
     void set_magic() { get_persistent_header()->magic = BTREE_NODE_MAGIC; }
 
     uint8_t version() const { return get_persistent_header_const()->version; }
-    uint16_t checksum() const { return get_persistent_header_const()->checksum; }
+    uint32_t checksum() const { return get_persistent_header_const()->checksum; }
     void init_checksum() { get_persistent_header()->checksum = 0; }
 
     void set_node_id(bnodeid_t id) { get_persistent_header()->node_id = id; }
     bnodeid_t node_id() const { return get_persistent_header_const()->node_id; }
 
     void set_checksum() {
-        get_persistent_header()->checksum = crc16_t10dif(bt_init_crc_16, node_data_area_const(), node_data_size());
+        get_persistent_header()->checksum = bt_crc32c(bt_init_crc32c, node_data_area_const(), node_data_size());
     }
 
     bool verify_node() const {
-        auto exp_checksum = crc16_t10dif(bt_init_crc_16, node_data_area_const(), node_data_size());
+        auto exp_checksum = bt_crc32c(bt_init_crc32c, node_data_area_const(), node_data_size());
         return ((magic() == BTREE_NODE_MAGIC) && (checksum() == exp_checksum));
     }
 
