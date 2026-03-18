@@ -297,7 +297,12 @@ protected:
         auto cp_ctx = r_cast< CPContext* >(context);
         auto idx_node = static_cast< IndexBtreeNode* >(node.get());
 
+        auto t0 = std::chrono::steady_clock::now();
         node->set_checksum();
+        auto t1 = std::chrono::steady_clock::now();
+        HISTOGRAM_OBSERVE(this->m_metrics, btree_set_checksum_latency,
+                          std::chrono::duration_cast< std::chrono::nanoseconds >(t1 - t0).count());
+
         auto prev_state = idx_node->m_idx_buf->m_state.exchange(index_buf_state_t::DIRTY);
         idx_node->m_idx_buf->m_node_level = node->level();
         if (prev_state == index_buf_state_t::CLEAN) {
@@ -307,7 +312,17 @@ protected:
                                  "Writing a node which was not acquired by this cp");
             }
             node->set_modified_cp_id(cp_ctx->id());
-            wb_cache().write_buf(node, idx_node->m_idx_buf, cp_ctx);
+
+            auto t2 = std::chrono::steady_clock::now();
+            wb_cache().cache_upsert(node);
+            auto t3 = std::chrono::steady_clock::now();
+            HISTOGRAM_OBSERVE(this->m_metrics, btree_cache_upsert_latency,
+                              std::chrono::duration_cast< std::chrono::nanoseconds >(t3 - t2).count());
+
+            wb_cache().dirty_buf(idx_node->m_idx_buf, cp_ctx);
+            auto t4 = std::chrono::steady_clock::now();
+            HISTOGRAM_OBSERVE(this->m_metrics, btree_dirty_list_latency,
+                              std::chrono::duration_cast< std::chrono::nanoseconds >(t4 - t3).count());
         } else {
             BT_DBG_ASSERT_NE(
                 (int)prev_state, (int)index_buf_state_t::FLUSHING,

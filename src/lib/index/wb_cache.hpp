@@ -49,6 +49,8 @@ public:
 
     BtreeNodePtr alloc_buf(uint32_t ordinal, node_initializer_t&& node_initializer) override;
     void write_buf(const BtreeNodePtr& node, const IndexBufferPtr& buf, CPContext* cp_ctx) override;
+    void cache_upsert(const BtreeNodePtr& node) override;
+    void dirty_buf(const IndexBufferPtr& buf, CPContext* cp_ctx) override;
     void read_buf(bnodeid_t id, BtreeNodePtr& node, node_initializer_t&& node_initializer) override;
 
     bool get_writable_buf(const BtreeNodePtr& node, CPContext* context) override;

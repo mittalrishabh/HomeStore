@@ -342,6 +342,12 @@ public:
                            HistogramBucketsType(OpLatecyBuckets));
         REGISTER_HISTOGRAM(btree_write_node_latency, "Latency of write_node (wb cache update) (ns)",
                            HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(btree_set_checksum_latency, "Latency of set_checksum in write_node (ns)",
+                           HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(btree_cache_upsert_latency, "Latency of cache upsert in write_node (ns)",
+                           HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(btree_dirty_list_latency, "Latency of add_to_dirty_list in write_node (ns)",
+                           HistogramBucketsType(OpLatecyBuckets));
 
         register_me_to_farm();
     }

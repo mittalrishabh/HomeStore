@@ -142,6 +142,17 @@ void IndexWBCache::write_buf(const BtreeNodePtr& node, const IndexBufferPtr& buf
     }
 }
 
+void IndexWBCache::cache_upsert(const BtreeNodePtr& node) {
+    if (node != nullptr && !m_in_recovery) { m_cache.upsert(node); }
+}
+
+void IndexWBCache::dirty_buf(const IndexBufferPtr& buf, CPContext* cp_ctx) {
+    if (!m_in_recovery) {
+        r_cast< IndexCPContext* >(cp_ctx)->add_to_dirty_list(buf);
+        resource_mgr().inc_dirty_buf_size(m_node_size);
+    }
+}
+
 void IndexWBCache::read_buf(bnodeid_t id, BtreeNodePtr& node, node_initializer_t&& node_initializer) {
     auto const blkid = BlkId{id};
 
