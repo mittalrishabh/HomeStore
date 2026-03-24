@@ -144,6 +144,10 @@ retry:
             pkey = my_node->get_nth_key< K >(curr_idx - 1, true);
             if (child_node->total_entries() != 0) {
                 ckey = child_node->get_first_key< K >();
+                if (ckey.compare(pkey) < 0) {
+                    BT_NODE_LOG(CRITICAL, my_node, "parent separator pkey={} at idx={} > child first key ckey={}",
+                                pkey.to_string(), curr_idx - 1, ckey.to_string());
+                }
                 BT_NODE_DBG_ASSERT_GE(ckey.compare(pkey), 0, child_node);
             }
             // BT_NODE_DBG_ASSERT_EQ((is_range_put_req(req) || k.compare(pkey) >= 0), true, my_node);
@@ -179,7 +183,7 @@ btree_status_t Btree< K, V >::mutate_extents_in_leaf(const BtreeNodePtr& my_node
         // When start_inclusive is false, the working range start key is the separator from the previous
         // child — we already wrote up to its end_lba, so we must begin at end_lba + 1 to avoid overlap.
         auto const new_start = working.is_start_inclusive() ? new_start_key.lba_start()
-                                                           : new_start_key.end_lba() + 1;
+                                                           : new_start_key.lba_start() + 1;
         auto const new_end = new_end_key.end_lba(); // Use end_lba() since trimmed keys may have nlba > 1
         auto const* new_val = s_cast< V const* >(rpreq.m_newval);
         // The input range start is the original write start — used for blkid offset calculation
@@ -443,8 +447,17 @@ btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const 
                           "Unable to split entries in the child node"); // means cannot split entries
     BT_NODE_DBG_ASSERT_GT(child_node1->total_entries(), 0, child_node1);
 
-    // Insert the last entry in first child to parent node
-    *out_split_key = child_node1->get_last_key< K >();
+    // Insert the last entry in first child to parent node.
+    // For extent keys, use a point key (end_lba, 1) as the separator instead of the full range.
+    // Interior node separators must maintain a strict total order for binary search. Extent keys
+    // use overlap-based compare (ranges that share any LBA compare as equal), so range-based
+    // separators can overlap with stale separators from prior splits, breaking the total order.
+    // Point keys at distinct LBAs never overlap, preserving the invariant.
+    if constexpr (requires(K k) { k.end_lba(); }) {
+        *out_split_key = K{child_node1->get_last_key< K >().end_lba(), 1};
+    } else {
+        *out_split_key = child_node1->get_last_key< K >();
+    }
 
     BT_NODE_LOG(TRACE, parent_node, "Available space for split entry={}", parent_node->available_size());
 
@@ -456,9 +469,15 @@ btree_status_t Btree< K, V >::split_node(const BtreeNodePtr& parent_node, const 
     // parent node. If we insert the split key first, then the split key will be inserted in the parent node and the
     // last key in the parent node will be lost. This will lead to inconsistency in the tree. In case of empty parent
     // (i.e., new root) or updating the edge, this order made sure that edge is updated.
+    //
+    // Only update the child pointer, NOT the separator key. The key at parent_ind is the boundary
+    // with the next child (not involved in this split) and must remain unchanged.
     parent_node->update(parent_ind, child_node2->link_info());
     parent_node->insert(parent_ind, *out_split_key, child_node1->link_info());
 
+    // child1's last key should overlap with or equal the split key (split key is derived from it)
+    BT_NODE_DBG_ASSERT_GE(child_node1->get_last_key< K >().compare(*out_split_key), 0, child_node1);
+    // child2's first key must be strictly after the split key
     BT_NODE_DBG_ASSERT_GT(child_node2->get_first_key< K >().compare(*out_split_key), 0, child_node2);
     BT_NODE_LOG(DEBUG, parent_node, "Split child_node={} with new_child_node={}, split_key={}", child_node1->node_id(),
                 child_node2->node_id(), out_split_key->to_string());
