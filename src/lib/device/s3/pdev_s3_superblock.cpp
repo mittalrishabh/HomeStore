@@ -199,8 +199,18 @@ S3Result PdevS3Superblock::read_from_s3(S3ObjectStore& s3_store, const std::stri
 }
 
 uint64_t PdevS3Superblock::compute_checksum(const uint8_t* data, uint64_t size) {
-    // Use HomeStore's standard CRC-32C
-    return crc32_ieee(init_crc32, data, static_cast< uint32_t >(size));
+    // Use HomeStore's standard CRC-32C.
+    // Feed in UINT32_MAX-sized chunks to avoid truncation if size > 4GB.
+    uint32_t crc = init_crc32;
+    uint64_t remaining = size;
+    const uint8_t* ptr = data;
+    while (remaining > 0) {
+        auto chunk = static_cast< uint32_t >(std::min< uint64_t >(remaining, UINT32_MAX));
+        crc = crc32_ieee(crc, ptr, chunk);
+        ptr += chunk;
+        remaining -= chunk;
+    }
+    return crc;
 }
 
 } // namespace homestore

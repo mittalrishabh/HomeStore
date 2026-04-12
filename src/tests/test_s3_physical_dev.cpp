@@ -120,6 +120,7 @@ TEST_F(S3PhysicalDevTest, WriteStashesDirtyBlock) {
     constexpr chunk_id_t CHUNK_ID = 10;
     auto data = make_test_data(512, 0xAA);
 
+    m_pdev->create_chunk(CHUNK_ID, 4096, S3ChunkType::DATA, 1);
     m_pdev->write(CHUNK_ID, 0, data);
 
     ASSERT_TRUE(m_pdev->is_chunk_dirty(CHUNK_ID));
@@ -129,8 +130,9 @@ TEST_F(S3PhysicalDevTest, WriteStashesDirtyBlock) {
 TEST_F(S3PhysicalDevTest, WriteIsNotACopy) {
     constexpr chunk_id_t CHUNK_ID = 20;
     auto data = make_test_data(256, 0xBB);
-    auto use_count_before = data.use_count();
 
+    m_pdev->create_chunk(CHUNK_ID, 4096, S3ChunkType::DATA, 1);
+    auto use_count_before = data.use_count();
     m_pdev->write(CHUNK_ID, 100, data);
 
     ASSERT_GT(data.use_count(), use_count_before);
@@ -139,6 +141,7 @@ TEST_F(S3PhysicalDevTest, WriteIsNotACopy) {
 TEST_F(S3PhysicalDevTest, MultipleWritesSameChunk) {
     constexpr chunk_id_t CHUNK_ID = 5;
 
+    m_pdev->create_chunk(CHUNK_ID, 4096, S3ChunkType::DATA, 1);
     m_pdev->write(CHUNK_ID, 0, make_test_data(128, 0x01));
     m_pdev->write(CHUNK_ID, 128, make_test_data(256, 0x02));
     m_pdev->write(CHUNK_ID, 384, make_test_data(128, 0x03));
@@ -147,9 +150,21 @@ TEST_F(S3PhysicalDevTest, MultipleWritesSameChunk) {
     ASSERT_EQ(m_pdev->dirty_cache_size_bytes(), 512u);
 }
 
+TEST_F(S3PhysicalDevTest, WriteToUnknownChunkIsRejected) {
+    constexpr chunk_id_t CHUNK_ID = 999;
+    auto data = make_test_data(128, 0xFF);
+
+    // write() to a chunk that was never create_chunk()'d should be silently ignored
+    m_pdev->write(CHUNK_ID, 0, data);
+
+    ASSERT_FALSE(m_pdev->is_chunk_dirty(CHUNK_ID));
+    ASSERT_EQ(m_pdev->dirty_cache_size_bytes(), 0u);
+}
+
 TEST_F(S3PhysicalDevTest, DrainDirtyCacheReturnsBlocks) {
     constexpr chunk_id_t CHUNK_ID = 15;
 
+    m_pdev->create_chunk(CHUNK_ID, 4096, S3ChunkType::DATA, 1);
     m_pdev->write(CHUNK_ID, 0, make_test_data(100, 0xAA));
     m_pdev->write(CHUNK_ID, 200, make_test_data(100, 0xBB));
 
@@ -171,6 +186,9 @@ TEST_F(S3PhysicalDevTest, DrainEmptyChunkReturnsEmpty) {
 }
 
 TEST_F(S3PhysicalDevTest, DrainAllDirtyCache) {
+    m_pdev->create_chunk(1, 4096, S3ChunkType::DATA, 1);
+    m_pdev->create_chunk(2, 4096, S3ChunkType::DATA, 1);
+    m_pdev->create_chunk(3, 4096, S3ChunkType::DATA, 1);
     m_pdev->write(1, 0, make_test_data(64));
     m_pdev->write(2, 0, make_test_data(128));
     m_pdev->write(3, 0, make_test_data(256));
@@ -250,6 +268,10 @@ TEST_F(S3PhysicalDevTest, SuperblockGenerationIncrements) {
 
 TEST_F(S3PhysicalDevTest, DirtyCacheThresholdTriggersEarlyFlush) {
     constexpr uint32_t BIG_SIZE = 512 * 1024;
+
+    m_pdev->create_chunk(1, BIG_SIZE, S3ChunkType::DATA, 1);
+    m_pdev->create_chunk(2, BIG_SIZE, S3ChunkType::DATA, 1);
+    m_pdev->create_chunk(3, BIG_SIZE, S3ChunkType::DATA, 1);
 
     m_pdev->write(1, 0, make_test_data(BIG_SIZE));
     ASSERT_EQ(m_cp_flush_cb->flush_count, 0);

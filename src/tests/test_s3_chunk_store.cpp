@@ -503,6 +503,69 @@ TEST_F(PdevS3SuperblockTest, IncrementGeneration) {
     ASSERT_EQ(sb.generation(), 2u);
 }
 
+///////////////////////////////////////////////////////////////////////////////
+// FullChunkStore LRU Cache Tests
+///////////////////////////////////////////////////////////////////////////////
+class FullChunkStoreCacheTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        m_s3_store = std::make_shared< MockS3ObjectStore >(make_test_config());
+        m_nvme_reader = std::make_shared< MockNvmeChunkReader >();
+        m_key_mapper = S3KeyMapper{.volume_id = "vol-001"};
+        // Set max cache to 8KB for testing eviction
+        m_chunk_store = std::make_unique< FullChunkStore >(
+            m_s3_store, m_nvme_reader, m_key_mapper, /*max_cache_bytes=*/8192);
+    }
+
+    std::shared_ptr< MockS3ObjectStore > m_s3_store;
+    std::shared_ptr< MockNvmeChunkReader > m_nvme_reader;
+    S3KeyMapper m_key_mapper;
+    std::unique_ptr< FullChunkStore > m_chunk_store;
+};
+
+TEST_F(FullChunkStoreCacheTest, CacheEvictsLRUWhenOverBudget) {
+    // Each chunk is 4KB. Cache limit is 8KB. So 2 chunks fit, 3rd evicts the oldest.
+    constexpr uint64_t CHUNK_SIZE = 4096;
+
+    for (chunk_id_t cid = 1; cid <= 3; ++cid) {
+        m_nvme_reader->set_chunk_data(cid, make_test_data(CHUNK_SIZE, static_cast< uint8_t >(cid)));
+        m_chunk_store->put(cid, {}, CHUNK_SIZE);
+    }
+
+    // Cache should be at most 8KB (2 chunks)
+    ASSERT_LE(m_chunk_store->cache_size_bytes(), 8192u);
+
+    // Chunk 1 (LRU) should have been evicted. Reading it will re-fetch from S3.
+    // Chunks 2 and 3 should still be cached.
+    auto [r2, d2] = m_chunk_store->get(2, 0, 1).get();
+    ASSERT_TRUE(r2.ok());
+    ASSERT_EQ(d2->cbytes()[0], 2u);
+
+    auto [r3, d3] = m_chunk_store->get(3, 0, 1).get();
+    ASSERT_TRUE(r3.ok());
+    ASSERT_EQ(d3->cbytes()[0], 3u);
+}
+
+TEST_F(FullChunkStoreCacheTest, LookupPromotesToMRU) {
+    constexpr uint64_t CHUNK_SIZE = 4096;
+
+    // Insert chunks 1 and 2 (fills 8KB cache)
+    for (chunk_id_t cid = 1; cid <= 2; ++cid) {
+        m_nvme_reader->set_chunk_data(cid, make_test_data(CHUNK_SIZE, static_cast< uint8_t >(cid)));
+        m_chunk_store->put(cid, {}, CHUNK_SIZE);
+    }
+
+    // Access chunk 1 to promote it to MRU
+    auto [r1, d1] = m_chunk_store->get(1, 0, 1).get();
+    ASSERT_TRUE(r1.ok());
+
+    // Insert chunk 3 — should evict chunk 2 (now LRU), not chunk 1
+    m_nvme_reader->set_chunk_data(3, make_test_data(CHUNK_SIZE, 3));
+    m_chunk_store->put(3, {}, CHUNK_SIZE);
+
+    ASSERT_LE(m_chunk_store->cache_size_bytes(), 8192u);
+}
+
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
     SISL_OPTIONS_LOAD(argc, argv, logging);

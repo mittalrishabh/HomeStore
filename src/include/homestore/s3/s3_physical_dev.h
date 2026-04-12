@@ -21,6 +21,7 @@
 #include <string>
 #include <vector>
 
+#include <folly/futures/Future.h>
 #include <sisl/fds/buffer.hpp>
 #include <sisl/logging/logging.h>
 #include <sisl/metrics/metrics.hpp>

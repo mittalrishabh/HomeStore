@@ -43,6 +43,14 @@ S3PhysicalDev::S3PhysicalDev(uint32_t pdev_id,
 ///////////////////////// Write/Read Operations /////////////////////////
 
 void S3PhysicalDev::write(chunk_id_t chunk_id, offset_t offset, const sisl::byte_array& data) {
+    // Validate chunk exists in superblock — writes to unknown chunks would be
+    // orphaned at drain time (no superblock entry = no recovery).
+    DEBUG_ASSERT(has_chunk(chunk_id), "write() to chunk_id={} that was never create_chunk()'d", chunk_id);
+    if (!has_chunk(chunk_id)) {
+        LOGWARNMOD(s3, "S3PhysicalDev::write() to unknown chunk_id={} — ignoring (no superblock entry)", chunk_id);
+        return;
+    }
+
     // This is ~instant: just a map insert + shared_ptr bump (no data copy).
     // The sisl::byte_array is a shared_ptr<io_blob_safe>, so "caching" is
     // incrementing the refcount, not copying bytes.
@@ -111,7 +119,9 @@ void S3PhysicalDev::remove_chunk(chunk_id_t chunk_id) {
     // Get S3 key before removing from superblock
     auto* entry = m_superblock.find_chunk(chunk_id);
     if (entry) {
-        // Delete the S3 object (async API, .get() to block)
+        // Delete the S3 object.
+        // NOTE: .get() blocks the calling thread. Intentional for v1;
+        // v2 should batch deletes or pipeline them.
         auto s3_key = entry->get_s3_key();
         if (!s3_key.empty()) {
             auto result = m_s3_store->delete_object(s3_key).get();
@@ -177,7 +187,7 @@ std::map< chunk_id_t, std::vector< DirtyBlock > > S3PhysicalDev::drain_all_dirty
     std::lock_guard< std::mutex > lock{m_dirty_cache_mutex};
 
     auto all_blocks = std::move(m_dirty_cache);
-    m_dirty_cache.clear();
+    // Note: moved-from map is in a valid empty state; no .clear() needed.
     m_dirty_cache_bytes.store(0, std::memory_order_relaxed);
 
     COUNTER_SET(m_metrics, s3_dirty_cache_bytes, 0);
