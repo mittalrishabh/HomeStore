@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <vector>
 
 #include <folly/futures/Future.h>
@@ -38,10 +39,12 @@ public:
     explicit S3CpMetrics() : sisl::MetricsGroupWrapper{"S3CpFlush", "s3_cp"} {
         REGISTER_COUNTER(s3_cp_flush_count, "Total S3 CP flush invocations");
         REGISTER_COUNTER(s3_cp_chunks_flushed, "Total chunks flushed to S3 across all CPs");
+        REGISTER_COUNTER(s3_cp_chunks_failed, "Total chunk uploads that failed");
         REGISTER_COUNTER(s3_cp_bytes_flushed, "Total bytes flushed to S3 across all CPs");
         REGISTER_COUNTER(s3_cp_flush_errors, "S3 CP flush error count");
         REGISTER_COUNTER(s3_cp_superblock_writes, "S3 superblock write count");
         REGISTER_COUNTER(s3_cp_early_triggers, "Early CP triggers from dirty cache threshold");
+        REGISTER_COUNTER(s3_cp_retry_chunks, "Chunks retried from previous failed CP");
 
         REGISTER_HISTOGRAM(s3_cp_flush_latency_us, "S3 CP flush latency (all pdevs) in us",
                            HistogramBucketsType(OpLatecyBuckets));
@@ -57,9 +60,8 @@ public:
 /**
  * @brief CPContext for S3 service — tracks dirty S3 pdevs that need flushing.
  *
- * Created during on_switchover_cp. At switchover time, we snapshot which
- * S3PhysicalDevs have dirty data and pre-drain their caches. During cp_flush,
- * we upload the drained data via ChunkStore and write the S3 superblock.
+ * Created during on_switchover_cp. At switchover time, we drain dirty caches
+ * and capture them here. During cp_flush, we upload the drained data.
  */
 class S3CpContext : public CPContext {
 public:
@@ -70,7 +72,6 @@ public:
     std::vector< S3PhysicalDev* > m_dirty_pdevs;
 
     /// Pre-drained dirty blocks per pdev (index matches m_dirty_pdevs)
-    /// Drained at switchover time so new writes go to the next CP.
     std::vector< std::map< chunk_id_t, std::vector< DirtyBlock > > > m_drained_data;
 
     /// Flush progress tracking
@@ -83,46 +84,38 @@ public:
  *        checkpoint pipeline. Also implements S3CpFlushCallback so that
  *        S3PhysicalDev's dirty cache threshold can trigger an early CP.
  *
- * ## CP Flush Flow (S3 side):
+ * ## CP Flush Flow:
  *
  * 1. on_switchover_cp:
- *    - Snapshot which S3PhysicalDevs have dirty data
- *    - drain_all_dirty_cache() immediately (new writes go to next CP)
- *    - Return S3CpContext with the drained data
+ *    - drain_all_dirty_cache() from each dirty pdev (atomic handoff)
+ *    - Include failed chunks from previous CP for retry
  *
- * 2. cp_flush (async via folly::Future chaining):
+ * 2. cp_flush (async via folly::Future):
  *    For each dirty S3PhysicalDev:
- *      a. Upload chunks in order: DATA → WAL → INDEX → METABLK
- *         (matches NVMe recovery ordering)
- *      b. For each chunk: ChunkStore::put(chunk_id, dirty_blocks, chunk_size)
- *      c. Update superblock chunk keys/generations
- *      d. write_superblock() → S3 commit point (written last)
+ *      a. Group chunks by type: DATA → WAL → INDEX → METABLK
+ *      b. Upload each type group with bounded concurrency (folly::collectAll)
+ *      c. write_superblock() → S3 commit point (written last, only on full success)
  *
- * 3. cp_cleanup:
- *    - Nothing to clean up for S3 (dirty cache already drained at switchover)
- *
- * ## Flush Ordering:
- *
- * Chunks are flushed in type order: DATA → WAL → INDEX → METABLK.
- * This matches the recovery download order and ensures that if the CP is
- * interrupted, the most critical metadata chunks are flushed last.
- * The pdev_s3 superblock is the absolute last write (S3 commit point).
+ * 3. cp_cleanup: no-op
  *
  * ## Error handling:
  *
- * If any chunk put fails, we log + continue flushing remaining chunks
- * (best effort). The pdev_s3 superblock is NOT written for that pdev
- * (previous generation remains valid). cp_flush returns false.
+ * If any chunk put fails:
+ *   - Log + continue uploading remaining chunks (best effort)
+ *   - Failed chunk IDs are saved and retried in the next CP
+ *   - Superblock is NOT written for that pdev (previous gen stays valid)
+ *   - cp_flush returns false
  */
 class S3CpCallbacks : public CPCallbacks, public S3CpFlushCallback {
 public:
+    static constexpr uint32_t DEFAULT_UPLOAD_CONCURRENCY = 4;
+
     /**
-     * @brief Construct S3CpCallbacks.
-     *
-     * @param s3_pdevs  All S3PhysicalDev instances managed by DeviceManager.
-     *                  The callback checks each for dirty data at CP time.
+     * @param s3_pdevs             All S3PhysicalDev instances
+     * @param upload_concurrency   Max parallel chunk uploads per type group
      */
-    explicit S3CpCallbacks(std::vector< S3PhysicalDev* > s3_pdevs);
+    explicit S3CpCallbacks(std::vector< S3PhysicalDev* > s3_pdevs,
+                           uint32_t upload_concurrency = DEFAULT_UPLOAD_CONCURRENCY);
     ~S3CpCallbacks() override = default;
 
     // CPCallbacks interface
@@ -131,29 +124,42 @@ public:
     void cp_cleanup(CP* cp) override;
     int cp_progress_percent() override;
 
-    // S3CpFlushCallback interface — wired to S3PhysicalDev dirty cache threshold
+    // S3CpFlushCallback interface
     void trigger_early_cp_flush() override;
 
-    /// Get the metrics
     S3CpMetrics& metrics() { return m_metrics; }
 
+    /// Chunks that failed in the last CP (will be retried)
+    std::set< chunk_id_t > failed_chunks(uint32_t pdev_id) const;
+
 private:
-    /// Flush a single S3PhysicalDev: put chunks (ordered by type), write superblock.
-    /// Returns a Future<bool> — true on success, false on any error.
+    /// Flush a single S3PhysicalDev with concurrent uploads.
     folly::Future< bool > flush_pdev(S3PhysicalDev* pdev,
                                       std::map< chunk_id_t, std::vector< DirtyBlock > >& drained,
                                       S3CpContext* ctx);
 
-    /// Sort chunk IDs by their S3ChunkType for ordered flushing.
-    /// Order: DATA(0) → WAL(2) → INDEX(1) → METABLK(3)
+    /// Sort chunks by flush order: DATA → WAL → INDEX → METABLK
     std::vector< chunk_id_t > sort_chunks_by_flush_order(
         const std::map< chunk_id_t, std::vector< DirtyBlock > >& drained,
         const PdevS3Superblock& superblock) const;
 
+    /// Upload a batch of chunks concurrently with bounded parallelism
+    std::set< chunk_id_t > upload_batch(
+        ChunkStore* chunk_store,
+        const PdevS3Superblock& superblock,
+        const std::vector< chunk_id_t >& chunk_ids,
+        std::map< chunk_id_t, std::vector< DirtyBlock > >& drained,
+        S3CpContext* ctx);
+
     std::vector< S3PhysicalDev* > m_s3_pdevs;
+    uint32_t m_upload_concurrency;
     S3CpMetrics m_metrics;
 
-    /// Progress tracking across CPs
+    /// Failed chunks per pdev — retried in the next CP
+    mutable std::mutex m_failed_mutex;
+    std::map< uint32_t, std::set< chunk_id_t > > m_failed_chunks; // pdev_id → failed chunk_ids
+
+    /// Progress tracking
     std::atomic< uint64_t > m_total_chunks_this_cp{0};
     std::atomic< uint64_t > m_flushed_chunks_this_cp{0};
 };
