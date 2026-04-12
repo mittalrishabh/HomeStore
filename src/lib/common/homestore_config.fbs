@@ -318,6 +318,30 @@ table Consensus {
     ssl_ca_file: string;
 }
 
+table S3 {
+    // Master switch — when false, no S3 code paths execute (zero overhead)
+    enabled: bool = false;
+
+    // Bucket naming: full bucket = "<bucket_prefix>-<cluster_id>"
+    bucket_prefix: string;    // default: "homestore" (set in code)
+    cluster_id: string;       // cluster identifier for bucket naming
+
+    // AWS / S3-compatible endpoint configuration
+    region: string;           // AWS region (e.g. "us-east-1")
+    endpoint: string;         // Optional — for S3-compatible stores (MinIO, etc.)
+
+    // Upload tuning
+    upload_concurrency: uint32 = 4;     // Max parallel chunk uploads per CP
+    retry_count: uint32 = 3;            // Retries per S3 operation
+    retry_backoff_ms: uint32 = 1000;    // Initial exponential backoff in ms
+
+    // ChunkStore backend: "full" (v1 full-chunk upload) or "sst" (v3 SST)
+    chunk_store_backend: string;        // default: "full" (set in code)
+
+    // Memory limit for dirty cache — forces early CP flush if exceeded
+    dirty_cache_max_mb: uint32 = 4096;
+}
+
 table HomeStoreSettings {
     version: uint32 = 1;
     generic: Generic;
@@ -329,6 +353,7 @@ table HomeStoreSettings {
     resource_limits: ResourceLimits;
     metablk: MetaBlkStore;
     consensus: Consensus;
+    s3: S3;
 }
 
 root_type HomeStoreSettings;
