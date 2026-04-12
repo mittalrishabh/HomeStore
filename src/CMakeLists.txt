@@ -43,6 +43,7 @@ add_subdirectory(lib/meta)
 add_subdirectory(lib/index)
 add_subdirectory(lib/blkdata_svc/)
 add_subdirectory(lib/replication/)
+add_subdirectory(lib/s3/)
 
 add_subdirectory(tests)
 set(HOMESTORE_OBJECTS
@@ -55,6 +56,7 @@ set(HOMESTORE_OBJECTS
     $<TARGET_OBJECTS:hs_index>
     $<TARGET_OBJECTS:hs_datasvc>
     $<TARGET_OBJECTS:hs_replication>
+    $<TARGET_OBJECTS:hs_s3>
     lib/homestore.cpp
     lib/crc.cpp
     lib/logging.cpp

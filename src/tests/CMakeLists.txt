@@ -157,6 +157,12 @@ if (${io_tests})
     endif()
 endif()
 
+# S3 Object Store tests (mock backend — no network needed)
+    add_executable(test_s3_object_store)
+    target_sources(test_s3_object_store PRIVATE test_s3_object_store.cpp)
+    target_link_libraries(test_s3_object_store homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3ObjectStore COMMAND test_s3_object_store)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)
