@@ -163,6 +163,11 @@ endif()
     target_link_libraries(test_s3_object_store homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME S3ObjectStore COMMAND test_s3_object_store)
 
+    add_executable(test_s3_physical_dev)
+    target_sources(test_s3_physical_dev PRIVATE test_s3_physical_dev.cpp)
+    target_link_libraries(test_s3_physical_dev homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3PhysicalDev COMMAND test_s3_physical_dev)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)
