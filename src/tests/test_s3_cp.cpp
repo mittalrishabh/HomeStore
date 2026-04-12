@@ -66,6 +66,28 @@ private:
     std::unordered_map< chunk_id_t, sisl::byte_array > m_chunks;
 };
 
+/**
+ * @brief Mock S3ObjectStore that records the order of put_object calls.
+ *
+ * Used to verify that chunks are flushed in the correct type order
+ * (DATA → WAL → INDEX → METABLK).
+ */
+class OrderTrackingS3Store : public MockS3ObjectStore {
+public:
+    using MockS3ObjectStore::MockS3ObjectStore;
+
+    folly::Future< S3Result > put_object(const std::string& key, sisl::io_blob_safe data) override {
+        m_put_order.push_back(key);
+        return MockS3ObjectStore::put_object(key, std::move(data));
+    }
+
+    const std::vector< std::string >& put_order() const { return m_put_order; }
+    void clear_order() { m_put_order.clear(); }
+
+private:
+    std::vector< std::string > m_put_order;
+};
+
 ///////////////////////////////////////////////////////////////////////////////
 // Helpers
 ///////////////////////////////////////////////////////////////////////////////
@@ -101,7 +123,7 @@ public:
 class S3CpTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        m_s3_store = std::make_shared< MockS3ObjectStore >(make_test_config());
+        m_s3_store = std::make_shared< OrderTrackingS3Store >(make_test_config());
         m_nvme_reader = std::make_shared< MockNvmeChunkReader >();
 
         S3KeyMapper key_mapper{.volume_id = "vol-001"};
@@ -120,7 +142,7 @@ protected:
             std::vector< S3PhysicalDev* >{m_pdev1.get(), m_pdev2.get()});
     }
 
-    std::shared_ptr< MockS3ObjectStore > m_s3_store;
+    std::shared_ptr< OrderTrackingS3Store > m_s3_store;
     std::shared_ptr< MockNvmeChunkReader > m_nvme_reader;
     std::shared_ptr< FullChunkStore > m_chunk_store;
     std::unique_ptr< S3PhysicalDev > m_pdev1;
@@ -129,7 +151,6 @@ protected:
 };
 
 TEST_F(S3CpTest, SwitchoverDetectsDirtyPdevs) {
-    // pdev1 has dirty data, pdev2 does not
     m_pdev1->create_chunk(10, 4096, S3ChunkType::DATA, 1);
     m_pdev1->write(10, 0, make_test_data(512, 0xAA));
 
@@ -142,6 +163,22 @@ TEST_F(S3CpTest, SwitchoverDetectsDirtyPdevs) {
     ASSERT_EQ(ctx->m_dirty_pdevs.size(), 1u);
     ASSERT_EQ(ctx->m_dirty_pdevs[0], m_pdev1.get());
     ASSERT_EQ(ctx->m_total_chunks.load(), 1u);
+    // Dirty cache should be drained at switchover
+    ASSERT_EQ(ctx->m_drained_data.size(), 1u);
+    ASSERT_EQ(ctx->m_drained_data[0].size(), 1u);
+}
+
+TEST_F(S3CpTest, SwitchoverDrainsCacheAtomically) {
+    m_pdev1->create_chunk(10, 4096, S3ChunkType::DATA, 1);
+    m_pdev1->write(10, 0, make_test_data(512, 0xAA));
+
+    auto cur_cp = std::make_unique< TestCP >();
+    auto new_cp = std::make_unique< TestCP >();
+    m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
+
+    // After switchover, dirty cache should be empty (drained into context)
+    ASSERT_FALSE(m_pdev1->is_chunk_dirty(10));
+    ASSERT_EQ(m_pdev1->dirty_cache_size_bytes(), 0u);
 }
 
 TEST_F(S3CpTest, SwitchoverNoDirtyPdevs) {
@@ -170,28 +207,25 @@ TEST_F(S3CpTest, SwitchoverMultipleDirtyPdevs) {
 
     ASSERT_EQ(ctx->m_dirty_pdevs.size(), 2u);
     ASSERT_EQ(ctx->m_total_chunks.load(), 2u);
+    ASSERT_EQ(ctx->m_drained_data.size(), 2u);
 }
 
 TEST_F(S3CpTest, FlushUploadsDirtyChunksAndWritesSuperblock) {
     constexpr chunk_id_t CHUNK_ID = 10;
     constexpr uint64_t CHUNK_SIZE = 4096;
 
-    // Set up NVMe data for the chunk (FullChunkStore reads from NVMe during put)
     auto nvme_data = make_test_data(CHUNK_SIZE, 0xDD);
     m_nvme_reader->set_chunk_data(CHUNK_ID, nvme_data);
 
-    // Create chunk and write dirty data
     m_pdev1->create_chunk(CHUNK_ID, CHUNK_SIZE, S3ChunkType::DATA, 1);
     m_pdev1->write(CHUNK_ID, 0, make_test_data(512, 0x01));
     m_pdev1->write(CHUNK_ID, 512, make_test_data(512, 0x02));
 
-    // Simulate CP switchover
     auto cur_cp = std::make_unique< TestCP >();
     auto new_cp = std::make_unique< TestCP >();
     auto ctx_ptr = m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
     new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
 
-    // Flush
     auto flush_result = m_callbacks->cp_flush(new_cp.get()).get();
     ASSERT_TRUE(flush_result);
 
@@ -199,18 +233,67 @@ TEST_F(S3CpTest, FlushUploadsDirtyChunksAndWritesSuperblock) {
     auto s3_key = "vol-001/chunks/" + std::to_string(CHUNK_ID) + "/data.dat";
     ASSERT_TRUE(m_s3_store->has_object(s3_key));
 
-    // Verify: dirty cache is drained
-    ASSERT_FALSE(m_pdev1->is_chunk_dirty(CHUNK_ID));
-    ASSERT_EQ(m_pdev1->dirty_cache_size_bytes(), 0u);
-
     // Verify: superblock was written to S3
     auto sb_key = "vol-001/pdev_superblock.bin";
     ASSERT_TRUE(m_s3_store->has_object(sb_key));
     ASSERT_EQ(m_pdev1->superblock().generation(), 1u);
 }
 
+TEST_F(S3CpTest, FlushOrderIsDataWalIndexMetablk) {
+    constexpr uint64_t CHUNK_SIZE = 4096;
+
+    // Create chunks of each type
+    m_pdev1->create_chunk(1, CHUNK_SIZE, S3ChunkType::METABLK, 1);
+    m_pdev1->create_chunk(2, CHUNK_SIZE, S3ChunkType::INDEX, 1);
+    m_pdev1->create_chunk(3, CHUNK_SIZE, S3ChunkType::DATA, 1);
+    m_pdev1->create_chunk(4, CHUNK_SIZE, S3ChunkType::WAL, 1);
+
+    // Set up NVMe data
+    for (chunk_id_t cid = 1; cid <= 4; ++cid) {
+        m_nvme_reader->set_chunk_data(cid, make_test_data(CHUNK_SIZE, static_cast< uint8_t >(cid)));
+    }
+
+    // Write dirty data to all chunks
+    for (chunk_id_t cid = 1; cid <= 4; ++cid) {
+        m_pdev1->write(cid, 0, make_test_data(128, static_cast< uint8_t >(cid)));
+    }
+
+    // Clear put order tracking
+    m_s3_store->clear_order();
+
+    // Flush
+    auto cur_cp = std::make_unique< TestCP >();
+    auto new_cp = std::make_unique< TestCP >();
+    auto ctx_ptr = m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
+    new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
+    auto flush_result = m_callbacks->cp_flush(new_cp.get()).get();
+    ASSERT_TRUE(flush_result);
+
+    // Verify put order: DATA(3) → WAL(4) → INDEX(2) → METABLK(1) → superblock
+    auto& order = m_s3_store->put_order();
+    ASSERT_GE(order.size(), 5u); // 4 chunks + 1 superblock
+
+    // Find the chunk data puts (not superblock)
+    std::vector< std::string > chunk_puts;
+    for (const auto& key : order) {
+        if (key.find("/chunks/") != std::string::npos) {
+            chunk_puts.push_back(key);
+        }
+    }
+    ASSERT_EQ(chunk_puts.size(), 4u);
+
+    // Expected order: chunk 3 (DATA), chunk 4 (WAL), chunk 2 (INDEX), chunk 1 (METABLK)
+    EXPECT_NE(chunk_puts[0].find("/chunks/3/"), std::string::npos) << "First should be DATA (chunk 3)";
+    EXPECT_NE(chunk_puts[1].find("/chunks/4/"), std::string::npos) << "Second should be WAL (chunk 4)";
+    EXPECT_NE(chunk_puts[2].find("/chunks/2/"), std::string::npos) << "Third should be INDEX (chunk 2)";
+    EXPECT_NE(chunk_puts[3].find("/chunks/1/"), std::string::npos) << "Fourth should be METABLK (chunk 1)";
+
+    // Superblock should be the last put
+    EXPECT_NE(order.back().find("pdev_superblock"), std::string::npos)
+        << "Superblock should be the last S3 write";
+}
+
 TEST_F(S3CpTest, FlushMultipleChunksAcrossMultiplePdevs) {
-    // Pdev1: two dirty chunks
     m_pdev1->create_chunk(10, 4096, S3ChunkType::DATA, 1);
     m_pdev1->create_chunk(11, 4096, S3ChunkType::INDEX, 1);
     m_nvme_reader->set_chunk_data(10, make_test_data(4096, 0xAA));
@@ -218,12 +301,10 @@ TEST_F(S3CpTest, FlushMultipleChunksAcrossMultiplePdevs) {
     m_pdev1->write(10, 0, make_test_data(256));
     m_pdev1->write(11, 0, make_test_data(128));
 
-    // Pdev2: one dirty chunk
     m_pdev2->create_chunk(20, 8192, S3ChunkType::WAL, 2);
     m_nvme_reader->set_chunk_data(20, make_test_data(8192, 0xCC));
     m_pdev2->write(20, 0, make_test_data(512));
 
-    // Switchover
     auto cur_cp = std::make_unique< TestCP >();
     auto new_cp = std::make_unique< TestCP >();
     auto ctx_ptr = m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
@@ -231,13 +312,8 @@ TEST_F(S3CpTest, FlushMultipleChunksAcrossMultiplePdevs) {
     ASSERT_EQ(ctx->m_total_chunks.load(), 3u);
     new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
 
-    // Flush
     auto flush_result = m_callbacks->cp_flush(new_cp.get()).get();
     ASSERT_TRUE(flush_result);
-
-    // All pdevs flushed
-    ASSERT_EQ(m_pdev1->dirty_cache_size_bytes(), 0u);
-    ASSERT_EQ(m_pdev2->dirty_cache_size_bytes(), 0u);
 }
 
 TEST_F(S3CpTest, FlushWithNoDirtyData) {
@@ -246,7 +322,6 @@ TEST_F(S3CpTest, FlushWithNoDirtyData) {
     auto ctx_ptr = m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
     new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
 
-    // Flush with nothing dirty should succeed
     auto flush_result = m_callbacks->cp_flush(new_cp.get()).get();
     ASSERT_TRUE(flush_result);
 }
@@ -255,17 +330,14 @@ TEST_F(S3CpTest, ProgressReporting) {
     m_pdev1->create_chunk(10, 4096, S3ChunkType::DATA, 1);
     m_pdev1->write(10, 0, make_test_data(256));
 
-    // Before switchover: 100% (nothing to do)
     ASSERT_EQ(m_callbacks->cp_progress_percent(), 100);
 
-    // After switchover: 0%
     auto cur_cp = std::make_unique< TestCP >();
     auto new_cp = std::make_unique< TestCP >();
     auto ctx_ptr = m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
     new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
     ASSERT_EQ(m_callbacks->cp_progress_percent(), 0);
 
-    // After flush: 100%
     m_nvme_reader->set_chunk_data(10, make_test_data(4096, 0xDD));
     m_callbacks->cp_flush(new_cp.get()).get();
     ASSERT_EQ(m_callbacks->cp_progress_percent(), 100);
@@ -308,15 +380,20 @@ TEST_F(S3CpTest, CleanupIsNoOp) {
     auto new_cp = std::make_unique< TestCP >();
     auto ctx_ptr = m_callbacks->on_switchover_cp(cur_cp.get(), new_cp.get());
     new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
-
-    // Should not crash or do anything
     m_callbacks->cp_cleanup(new_cp.get());
 }
 
 TEST_F(S3CpTest, ConsumerIdExists) {
-    // Verify S3_SVC is a valid consumer
     ASSERT_EQ(static_cast< uint8_t >(cp_consumer_t::S3_SVC), 4u);
     ASSERT_EQ(static_cast< uint8_t >(cp_consumer_t::SENTINEL), 5u);
+}
+
+TEST_F(S3CpTest, S3CpCallbacksImplementsFlushCallback) {
+    // Verify S3CpCallbacks can be used as S3CpFlushCallback
+    S3CpFlushCallback* flush_cb = m_callbacks.get();
+    ASSERT_NE(flush_cb, nullptr);
+    // trigger_early_cp_flush() calls cp_mgr() which isn't initialized in test,
+    // so we just verify the interface is wired up.
 }
 
 int main(int argc, char* argv[]) {
