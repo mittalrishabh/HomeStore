@@ -38,8 +38,10 @@ public:
     folly::Future< S3Result > delete_object(const std::string& key) override;
     folly::Future< S3Result > delete_objects(const std::vector< std::string >& keys) override;
     folly::Future< S3Result > head_object(const std::string& key) override;
-    folly::Future< std::pair< S3Result, std::vector< S3ObjectInfo > > >
-    list_objects(const std::string& prefix) override;
+    folly::Future< S3ListResult >
+    list_objects(const std::string& prefix, const std::string& continuation_token = {},
+                 uint32_t max_keys = 0) override;
+    const std::string& bucket_name() const override { return m_cfg.bucket; }
     folly::Future< S3Result > copy_object(const std::string& src_key, const std::string& dst_key) override;
 
     /// Test helpers

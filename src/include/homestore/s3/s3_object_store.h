@@ -44,6 +44,14 @@ struct S3ObjectInfo {
     std::string etag;
 };
 
+/// Result of a paginated list_objects call.
+struct S3ListResult {
+    S3Result result;
+    std::vector< S3ObjectInfo > objects;
+    bool truncated{false};                  ///< true if more results available
+    std::string next_continuation_token;    ///< pass to next call to resume
+};
+
 /// Configuration needed to connect to an S3 (or S3-compatible) endpoint.
 struct S3ObjectStoreConfig {
     std::string bucket;           ///< Full bucket name, e.g. "homestore-<cluster_id>"
@@ -83,9 +91,16 @@ public:
     /// Check if object exists and get size/etag.
     virtual folly::Future< S3Result > head_object(const std::string& key) = 0;
 
-    /// List objects under `prefix`.
-    virtual folly::Future< std::pair< S3Result, std::vector< S3ObjectInfo > > >
-    list_objects(const std::string& prefix) = 0;
+    /// List objects under `prefix`, with optional pagination.
+    /// @param prefix        Key prefix to filter by
+    /// @param continuation_token  Resume token from a previous truncated response (empty = start)
+    /// @param max_keys      Max objects to return per call (0 = S3 default, typically 1000)
+    virtual folly::Future< S3ListResult >
+    list_objects(const std::string& prefix, const std::string& continuation_token = {},
+                 uint32_t max_keys = 0) = 0;
+
+    /// Convenience: bucket this store operates on.
+    virtual const std::string& bucket_name() const = 0;
 
     /// Server-side copy (for clone operations).
     virtual folly::Future< S3Result > copy_object(const std::string& src_key, const std::string& dst_key) = 0;

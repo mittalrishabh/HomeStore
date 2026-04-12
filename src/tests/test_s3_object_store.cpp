@@ -155,9 +155,42 @@ TEST_F(MockS3ObjectStoreTest, ListByPrefix) {
     m_store->put_object("vol1/chunks/2/data.dat", make_blob("b")).get();
     m_store->put_object("vol2/chunks/1/data.dat", make_blob("c")).get();
 
-    auto [res, objects] = m_store->list_objects("vol1/").get();
-    ASSERT_TRUE(res.ok());
-    EXPECT_EQ(objects.size(), 2);
+    auto lr = m_store->list_objects("vol1/").get();
+    ASSERT_TRUE(lr.result.ok());
+    EXPECT_EQ(lr.objects.size(), 2);
+    EXPECT_FALSE(lr.truncated);
+}
+
+TEST_F(MockS3ObjectStoreTest, ListPaginated) {
+    // Insert 5 objects
+    for (int i = 0; i < 5; ++i) {
+        m_store->put_object("pg/key" + std::to_string(i), make_blob("v" + std::to_string(i))).get();
+    }
+
+    // Page 1: max_keys=2
+    auto page1 = m_store->list_objects("pg/", {}, 2).get();
+    ASSERT_TRUE(page1.result.ok());
+    EXPECT_EQ(page1.objects.size(), 2);
+    EXPECT_TRUE(page1.truncated);
+    EXPECT_FALSE(page1.next_continuation_token.empty());
+
+    // Page 2: continue from token
+    auto page2 = m_store->list_objects("pg/", page1.next_continuation_token, 2).get();
+    ASSERT_TRUE(page2.result.ok());
+    EXPECT_EQ(page2.objects.size(), 2);
+    EXPECT_TRUE(page2.truncated);
+
+    // Page 3: last page
+    auto page3 = m_store->list_objects("pg/", page2.next_continuation_token, 2).get();
+    ASSERT_TRUE(page3.result.ok());
+    EXPECT_EQ(page3.objects.size(), 1);
+    EXPECT_FALSE(page3.truncated);
+}
+
+// ─── Bucket name accessor ─────────────────────────────────────────────────────────
+
+TEST_F(MockS3ObjectStoreTest, BucketName) {
+    EXPECT_EQ(m_store->bucket_name(), "test-bucket");
 }
 
 // ─── Copy ──────────────────────────────────────────────────────────────────

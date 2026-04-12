@@ -158,23 +158,50 @@ folly::Future< S3Result > MockS3ObjectStore::head_object(const std::string& key)
 
 // ─── list ───────────────────────────────────────────────────────────────────
 
-folly::Future< std::pair< S3Result, std::vector< S3ObjectInfo > > >
-MockS3ObjectStore::list_objects(const std::string& prefix) {
-    LOGDEBUG("MockS3: list_objects prefix={}", prefix);
+folly::Future< S3ListResult >
+MockS3ObjectStore::list_objects(const std::string& prefix, const std::string& continuation_token,
+                                uint32_t max_keys) {
+    LOGDEBUG("MockS3: list_objects prefix={} token={} max_keys={}", prefix, continuation_token, max_keys);
 
-    std::vector< S3ObjectInfo > result;
-
-    std::lock_guard lg(m_mtx);
-    for (const auto& [key, blob] : m_objects) {
-        if (key.rfind(prefix, 0) == 0) { // starts_with
-            S3ObjectInfo info;
-            info.key = key;
-            info.size = blob.size();
-            result.push_back(std::move(info));
+    // Collect all matching keys, sorted for deterministic pagination.
+    std::vector< std::string > matching;
+    {
+        std::lock_guard lg(m_mtx);
+        for (const auto& [key, blob] : m_objects) {
+            if (key.rfind(prefix, 0) == 0) { matching.push_back(key); }
         }
     }
+    std::sort(matching.begin(), matching.end());
 
-    return folly::makeFuture(std::make_pair(make_ok(), std::move(result)));
+    // Find start position based on continuation token.
+    auto start_it = matching.begin();
+    if (!continuation_token.empty()) {
+        start_it = std::upper_bound(matching.begin(), matching.end(), continuation_token);
+    }
+
+    uint32_t limit = (max_keys > 0) ? max_keys : static_cast< uint32_t >(matching.size());
+
+    S3ListResult lr;
+    lr.result = make_ok();
+    uint32_t count = 0;
+    for (auto it = start_it; it != matching.end() && count < limit; ++it, ++count) {
+        std::lock_guard lg(m_mtx);
+        auto obj_it = m_objects.find(*it);
+        if (obj_it == m_objects.end()) continue;
+        S3ObjectInfo info;
+        info.key = *it;
+        info.size = obj_it->second.size();
+        lr.objects.push_back(std::move(info));
+    }
+
+    // Check if there are more results.
+    if (start_it != matching.end() &&
+        std::distance(start_it, matching.end()) > static_cast< ptrdiff_t >(limit)) {
+        lr.truncated = true;
+        lr.next_continuation_token = lr.objects.back().key;
+    }
+
+    return folly::makeFuture(std::move(lr));
 }
 
 // ─── copy ───────────────────────────────────────────────────────────────────
