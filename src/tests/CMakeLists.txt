@@ -169,6 +169,12 @@ endif()
     target_link_libraries(test_nvme_superblock_fallback homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME NvmeSuperblockFallback COMMAND test_nvme_superblock_fallback)
 
+    # S3 CP Handler tests (Task 1.5)
+    add_executable(test_s3_cp_handler)
+    target_sources(test_s3_cp_handler PRIVATE test_s3_cp_handler.cpp)
+    target_link_libraries(test_s3_cp_handler homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3CpHandler COMMAND test_s3_cp_handler)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)

@@ -5,5 +5,6 @@ add_library(hs_s3 OBJECT)
 target_sources(hs_s3 PRIVATE
     mock_s3_object_store.cpp
     nvme_superblock_fallback.cpp
+    s3_cp_handler.cpp
 )
 target_link_libraries(hs_s3 hs_common ${COMMON_DEPS})
