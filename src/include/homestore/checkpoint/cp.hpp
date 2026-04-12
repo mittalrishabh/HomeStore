@@ -79,7 +79,8 @@ VENUM(cp_consumer_t, uint8_t,
       INDEX_SVC = 1,       // Index service module
       BLK_DATA_SVC = 2,    // Block data service module
       REPLICATION_SVC = 3, // Replication service module
-      SENTINEL = 4         // Should always be the last in this list
+      S3_SVC = 4,          // S3 pdev flush service (flushes dirty chunks to S3 at CP time)
+      SENTINEL = 5         // Should always be the last in this list
 );
 
 struct CP {
