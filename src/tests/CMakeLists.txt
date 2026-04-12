@@ -163,6 +163,12 @@ endif()
     target_link_libraries(test_s3_object_store homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME S3ObjectStore COMMAND test_s3_object_store)
 
+    # NVMe Superblock Fallback + Ping-Pong tests (Task 2.3)
+    add_executable(test_nvme_superblock_fallback)
+    target_sources(test_nvme_superblock_fallback PRIVATE test_nvme_superblock_fallback.cpp)
+    target_link_libraries(test_nvme_superblock_fallback homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME NvmeSuperblockFallback COMMAND test_nvme_superblock_fallback)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)
