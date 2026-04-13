@@ -193,6 +193,12 @@ endif()
     target_link_libraries(test_eviction_policy homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME EvictionPolicy COMMAND test_eviction_policy)
 
+    # Snapshot Manager — Snapshot Creation tests (Task 4.1)
+    add_executable(test_snapshot_manager)
+    target_sources(test_snapshot_manager PRIVATE test_snapshot_manager.cpp)
+    target_link_libraries(test_snapshot_manager homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME SnapshotManager COMMAND test_snapshot_manager)
+
     # On-Demand Recovery — Fast Startup tests (Task 3.3)
     add_executable(test_on_demand_recovery)
     target_sources(test_on_demand_recovery PRIVATE test_on_demand_recovery.cpp)
