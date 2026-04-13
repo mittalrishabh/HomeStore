@@ -167,6 +167,7 @@ ChunkRecoveryResult S3RecoveryManager::recover_single_chunk(const s3_chunk_entry
             LOGWARNMOD(s3, "S3 recovery: retrying chunk_id={} (attempt {}/{}), backoff={}ms",
                        entry.chunk_id, attempt + 1, m_retry_count + 1, backoff_ms);
             COUNTER_INCREMENT(m_metrics, recovery_retries, 1);
+            // TODO(v2): use folly::futures::sleep() instead of blocking sleep to avoid starving the executor pool under concurrent failures
             std::this_thread::sleep_for(std::chrono::milliseconds(backoff_ms));
         }
 
@@ -184,6 +185,7 @@ ChunkRecoveryResult S3RecoveryManager::recover_single_chunk(const s3_chunk_entry
             continue;
         }
 
+        // TODO(v2): validate chunk CRC when superblock supports per-chunk checksums
         // Verify downloaded size matches expected chunk size
         if (state.data->size() != entry.chunk_size) {
             result.error_message = fmt::format(
