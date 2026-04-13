@@ -72,7 +72,8 @@ S3Result FullChunkStore::put(chunk_id_t chunk_id, const std::vector< DirtyBlock 
     // Step 2: Upload to S3 as a single object.
     // NOTE: .get() blocks the calling thread. This is intentional for v1 CP-time
     // behavior. v2 should pipeline puts across multiple chunks.
-    auto s3_key = m_key_mapper.chunk_data_key(chunk_id);
+    auto gen = m_active_generation.load(std::memory_order_relaxed);
+    auto s3_key = m_key_mapper.chunk_data_key(chunk_id, gen);
     auto blob = byte_array_to_blob(chunk_data);
     auto put_result = m_s3_store->put_object(s3_key, std::move(blob)).get();
     if (!put_result.ok()) {

@@ -14,6 +14,7 @@
  *********************************************************************************/
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <list>
 #include <memory>
@@ -126,6 +127,11 @@ public:
     /// Get max cache size in bytes
     uint64_t max_cache_bytes() const { return m_max_cache_bytes; }
 
+    /// Set the active generation for CoW naming. When > 0, put() writes to
+    /// generation-stamped keys instead of overwriting data.dat.
+    void set_active_generation(uint64_t gen) { m_active_generation = gen; }
+    uint64_t active_generation() const { return m_active_generation; }
+
 private:
     /// Fetch the full chunk from S3 and cache it locally (with dedup)
     folly::Future< std::pair< S3Result, sisl::byte_array > > fetch_and_cache(chunk_id_t chunk_id);
@@ -143,6 +149,7 @@ private:
     std::shared_ptr< NvmeChunkReader > m_nvme_reader;
     S3KeyMapper m_key_mapper;
     uint64_t m_max_cache_bytes;
+    std::atomic< uint64_t > m_active_generation{0};
 
     /// LRU cache: chunk_id → data, with LRU eviction.
     /// m_lru_list is ordered most-recent-first; m_cache_map points into it.

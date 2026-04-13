@@ -37,6 +37,33 @@ enum class S3ChunkType : uint8_t {
     METABLK = 3,
 };
 
+/// Per-chunk S3 key pinned by a snapshot.
+#pragma pack(1)
+struct s3_snapshot_chunk_key {
+    static constexpr size_t MAX_S3_KEY_LEN = 256;
+
+    uint64_t chunk_id{0};
+    char s3_key[MAX_S3_KEY_LEN]{};
+
+    void set_s3_key(const std::string& key) {
+        std::strncpy(s3_key, key.c_str(), MAX_S3_KEY_LEN - 1);
+        s3_key[MAX_S3_KEY_LEN - 1] = '\0';
+    }
+    std::string get_s3_key() const { return std::string{s3_key}; }
+};
+#pragma pack()
+
+/// Snapshot entry stored in the pdev_s3 superblock.
+#pragma pack(1)
+struct s3_snapshot_entry {
+    uint64_t snap_id{0};
+    uint64_t generation{0};
+    uint64_t btree_root_blkid{0};
+    uint32_t num_chunk_keys{0};
+    uint32_t reserved{0};
+};
+#pragma pack()
+
 /**
  * @brief Per-chunk entry in the pdev_s3 superblock.
  *
@@ -94,14 +121,14 @@ struct s3_chunk_entry {
 #pragma pack(1)
 struct pdev_s3_sb_header {
     static constexpr uint32_t MAGIC = 0x5033534B;  // "P3SK"
-    static constexpr uint32_t CURRENT_VERSION = 1;
+    static constexpr uint32_t CURRENT_VERSION = 2;
 
     uint32_t magic{MAGIC};
     uint32_t version{CURRENT_VERSION};
     uint64_t pdev_id{0};
     uint64_t generation{0};        ///< Monotonically increasing per CP flush
     uint32_t num_chunks{0};        ///< Number of s3_chunk_entry following the header
-    uint32_t reserved{0};
+    uint32_t num_snapshots{0};     ///< Number of snapshot entries after chunk entries
     uint64_t checksum{0};          ///< CRC-32C of the entire serialized buffer (this field zeroed during computation)
 };
 #pragma pack()
@@ -185,19 +212,35 @@ public:
      */
     S3Result read_from_s3(S3ObjectStore& s3_store, const std::string& volume_id);
 
+    // --- Snapshot API ---
+
+    struct SnapshotRecord {
+        s3_snapshot_entry header;
+        std::vector< s3_snapshot_chunk_key > chunk_keys;
+    };
+
+    uint32_t num_snapshots() const { return static_cast< uint32_t >(m_snapshots.size()); }
+    const std::vector< SnapshotRecord >& snapshots() const { return m_snapshots; }
+    bool has_snapshots() const { return !m_snapshots.empty(); }
+
+    void add_snapshot(const SnapshotRecord& snap) { m_snapshots.push_back(snap); }
+
+    bool remove_snapshot(uint64_t snap_id);
+
+    const SnapshotRecord* find_snapshot(uint64_t snap_id) const;
+
     /// Get the S3 key for the pdev superblock
     static std::string s3_key(const std::string& volume_id) {
         return volume_id + "/pdev_superblock.bin";
     }
 
     /// Get the total serialized size
-    uint64_t serialized_size() const {
-        return sizeof(pdev_s3_sb_header) + m_chunks.size() * sizeof(s3_chunk_entry);
-    }
+    uint64_t serialized_size() const;
 
 private:
     pdev_s3_sb_header m_header;
     std::vector< s3_chunk_entry > m_chunks;
+    std::vector< SnapshotRecord > m_snapshots;
 
     /// Compute CRC-32C over serialized data (with checksum field zeroed)
     static uint64_t compute_checksum(const uint8_t* data, uint64_t size);
