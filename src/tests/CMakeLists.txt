@@ -232,6 +232,12 @@ endif()
         set_tests_properties(AwsS3ObjectStore PROPERTIES TIMEOUT 120)
     endif()
 
+    # Integration tests — Groups 1, 3, 7: CP Flow, Bulk Recovery, Cross-Concern Integrity
+    add_executable(test_s3_integ_cp_recovery_integrity)
+    target_sources(test_s3_integ_cp_recovery_integrity PRIVATE test_s3_integ_cp_recovery_integrity.cpp)
+    target_link_libraries(test_s3_integ_cp_recovery_integrity homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3IntegCpRecoveryIntegrity COMMAND test_s3_integ_cp_recovery_integrity)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)
