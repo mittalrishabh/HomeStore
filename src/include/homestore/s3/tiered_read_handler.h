@@ -19,6 +19,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -55,6 +56,8 @@ public:
         REGISTER_HISTOGRAM(s3_read_fallback_latency_us, "S3 fallback read latency in us",
                            HistogramBucketsType(OpLatecyBuckets));
         REGISTER_HISTOGRAM(nvme_read_latency_us, "NVMe read latency in us",
+                           HistogramBucketsType(OpLatecyBuckets));
+        REGISTER_HISTOGRAM(s3_hydrate_latency_us, "S3-to-NVMe hydration write latency in us",
                            HistogramBucketsType(OpLatecyBuckets));
 
         register_me_to_farm();
@@ -169,9 +172,15 @@ public:
      */
     std::error_code hydrate(chunk_id_t chunk_id, uint64_t offset_in_chunk, uint64_t size);
 
-    /// Update configuration at runtime
-    void set_config(TieredReadConfig config) { m_config = config; }
-    TieredReadConfig config() const { return m_config; }
+    /// Update configuration at runtime (thread-safe)
+    void set_config(TieredReadConfig config) {
+        std::unique_lock lock{m_config_mtx};
+        m_config = config;
+    }
+    TieredReadConfig config() const {
+        std::shared_lock lock{m_config_mtx};
+        return m_config;
+    }
 
     /// Accessors
     TieredReadMetrics& metrics() { return m_metrics; }
@@ -184,6 +193,7 @@ private:
 
     S3PhysicalDev* m_s3_pdev;
     std::shared_ptr< NvmeDeviceIO > m_nvme_io;
+    mutable std::shared_mutex m_config_mtx;
     TieredReadConfig m_config;
     TieredReadMetrics m_metrics;
 };

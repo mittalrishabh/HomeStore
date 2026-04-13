@@ -28,11 +28,14 @@ TieredReadHandler::TieredReadHandler(S3PhysicalDev* s3_pdev,
     RELEASE_ASSERT(m_s3_pdev != nullptr, "S3PhysicalDev must not be null");
     RELEASE_ASSERT(m_nvme_io != nullptr, "NvmeDeviceIO must not be null");
     LOGDEBUGMOD(s3, "TieredReadHandler created: fallback={} hydrate={}",
-                m_config.s3_read_fallback_enabled, m_config.s3_hydrate_on_read);
+                config.s3_read_fallback_enabled, config.s3_hydrate_on_read);
 }
 
 folly::Future< std::pair< std::error_code, sisl::byte_array > >
 TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uint64_t size) {
+    // Snapshot config once to avoid races with set_config()
+    auto cfg = config();
+
     // Fast path: chunk is on NVMe
     if (m_nvme_io->is_chunk_on_nvme(chunk_id)) {
         auto start = std::chrono::steady_clock::now();
@@ -53,7 +56,7 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
         }
 
         // NVMe read failed — if S3 fallback disabled, return error
-        if (!m_config.s3_read_fallback_enabled) {
+        if (!cfg.s3_read_fallback_enabled) {
             LOGERRORMOD(s3, "Tiered read: NVMe read failed for chunk_id={}, S3 fallback disabled", chunk_id);
             COUNTER_INCREMENT(m_metrics, tiered_read_errors, 1);
             return folly::makeFuture(std::make_pair(ec, sisl::byte_array{}));
@@ -63,7 +66,7 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
     }
 
     // S3 fallback path
-    if (!m_config.s3_read_fallback_enabled) {
+    if (!cfg.s3_read_fallback_enabled) {
         LOGERRORMOD(s3, "Tiered read: chunk_id={} not on NVMe and S3 fallback disabled", chunk_id);
         COUNTER_INCREMENT(m_metrics, tiered_read_errors, 1);
         return folly::makeFuture(std::make_pair(
@@ -74,7 +77,7 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
 
     // Read from S3 via S3PhysicalDev → ChunkStore::get()
     return m_s3_pdev->read(chunk_id, offset_in_chunk, size).thenValue(
-        [this, chunk_id, offset_in_chunk, size, start](
+        [this, chunk_id, offset_in_chunk, size, start, cfg](
             std::pair< S3Result, sisl::byte_array >&& result) mutable
             -> std::pair< std::error_code, sisl::byte_array > {
 
@@ -96,19 +99,23 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
                         chunk_id, offset_in_chunk, size, elapsed_us);
 
             // Optional: hydrate to NVMe for fast subsequent reads
-            if (m_config.s3_hydrate_on_read && data) {
+            if (cfg.s3_hydrate_on_read && data) {
+                auto hydrate_start = std::chrono::steady_clock::now();
                 auto write_ec = m_nvme_io->nvme_write(
                     chunk_id, offset_in_chunk,
                     reinterpret_cast< const char* >(data->cbytes()), data->size());
+                auto hydrate_us = std::chrono::duration_cast< std::chrono::microseconds >(
+                    std::chrono::steady_clock::now() - hydrate_start).count();
+                HISTOGRAM_OBSERVE(m_metrics, s3_hydrate_latency_us, hydrate_us);
+
                 if (!write_ec) {
                     COUNTER_INCREMENT(m_metrics, s3_hydrate_count, 1);
-                    LOGDEBUGMOD(s3, "Tiered read: hydrated chunk_id={} offset={} size={} to NVMe",
-                                chunk_id, offset_in_chunk, data->size());
+                    LOGDEBUGMOD(s3, "Tiered read: hydrated chunk_id={} offset={} size={} to NVMe ({}us)",
+                                chunk_id, offset_in_chunk, data->size(), hydrate_us);
                 } else {
                     COUNTER_INCREMENT(m_metrics, s3_hydrate_failures, 1);
                     LOGWARNMOD(s3, "Tiered read: NVMe hydration failed for chunk_id={}: {}",
                                chunk_id, write_ec.message());
-                    // Hydration failure is non-fatal — we still have the S3 data
                 }
             }
 
@@ -118,6 +125,8 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
 
 std::error_code TieredReadHandler::sync_read(chunk_id_t chunk_id, uint64_t offset_in_chunk,
                                               char* buf, uint64_t size) {
+    auto cfg = config();
+
     // Fast path: NVMe
     if (m_nvme_io->is_chunk_on_nvme(chunk_id)) {
         auto start = std::chrono::steady_clock::now();
@@ -131,11 +140,11 @@ std::error_code TieredReadHandler::sync_read(chunk_id_t chunk_id, uint64_t offse
             return {};
         }
 
-        if (!m_config.s3_read_fallback_enabled) {
+        if (!cfg.s3_read_fallback_enabled) {
             COUNTER_INCREMENT(m_metrics, tiered_read_errors, 1);
             return ec;
         }
-    } else if (!m_config.s3_read_fallback_enabled) {
+    } else if (!cfg.s3_read_fallback_enabled) {
         COUNTER_INCREMENT(m_metrics, tiered_read_errors, 1);
         return std::make_error_code(std::errc::no_such_device);
     }
@@ -143,7 +152,11 @@ std::error_code TieredReadHandler::sync_read(chunk_id_t chunk_id, uint64_t offse
     // S3 fallback (blocking)
     auto [ec, data] = read_from_s3_and_hydrate(chunk_id, offset_in_chunk, size);
     if (!ec && data) {
-        std::memcpy(buf, data->cbytes(), std::min(static_cast< uint64_t >(data->size()), size));
+        auto copy_sz = std::min(static_cast< uint64_t >(data->size()), size);
+        std::memcpy(buf, data->cbytes(), copy_sz);
+        if (copy_sz < size) {
+            std::memset(buf + copy_sz, 0, size - copy_sz);
+        }
     }
     return ec;
 }
@@ -198,11 +211,17 @@ TieredReadHandler::read_from_s3_and_hydrate(chunk_id_t chunk_id, uint64_t offset
 
     COUNTER_INCREMENT(m_metrics, s3_read_fallback_count, 1);
 
-    // Optional hydration
-    if (m_config.s3_hydrate_on_read && data) {
+    // Optional hydration (uses caller's config snapshot via member — sync path only)
+    auto cfg = config();
+    if (cfg.s3_hydrate_on_read && data) {
+        auto hydrate_start = std::chrono::steady_clock::now();
         auto write_ec = m_nvme_io->nvme_write(
             chunk_id, offset_in_chunk,
             reinterpret_cast< const char* >(data->cbytes()), data->size());
+        auto hydrate_us = std::chrono::duration_cast< std::chrono::microseconds >(
+            std::chrono::steady_clock::now() - hydrate_start).count();
+        HISTOGRAM_OBSERVE(m_metrics, s3_hydrate_latency_us, hydrate_us);
+
         if (!write_ec) {
             COUNTER_INCREMENT(m_metrics, s3_hydrate_count, 1);
         } else {
