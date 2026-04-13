@@ -28,6 +28,7 @@
 #include <sisl/options/options.h>
 
 #include <homestore/s3/chunk_eviction_manager.h>
+#include <homestore/s3/chunk_hydration_manager.h>
 #include <homestore/s3/chunk_store.h>
 #include <homestore/s3/full_chunk_store.h>
 #include <homestore/s3/on_demand_recovery.h>
@@ -35,7 +36,6 @@
 #include <homestore/s3/s3_object_store.h>
 #include <homestore/s3/s3_physical_dev.h>
 #include <homestore/s3/s3_recovery.h>
-#include <homestore/s3/tiered_read_handler.h>
 #include "lib/s3/s3_object_store_impl.h"
 
 SISL_LOGGING_INIT(s3)
@@ -46,12 +46,6 @@ using namespace homestore;
 ///////////////////////////////////////////////////////////////////////////////
 // Test Helpers
 ///////////////////////////////////////////////////////////////////////////////
-static sisl::byte_array make_test_data(uint32_t size, uint8_t pattern = 0xAB) {
-    auto buf = sisl::make_byte_array(size, 0);
-    std::memset(buf->bytes(), pattern, size);
-    return buf;
-}
-
 static sisl::byte_array make_patterned_data(uint32_t size, uint8_t seed = 0) {
     auto buf = sisl::make_byte_array(size, 0);
     for (uint32_t i = 0; i < size; ++i) {
@@ -101,23 +95,9 @@ private:
 ///////////////////////////////////////////////////////////////////////////////
 class MockNvmeChunkReader : public NvmeChunkReader {
 public:
-    void set_chunk_data(chunk_id_t chunk_id, sisl::byte_array data) {
-        m_chunks[chunk_id] = std::move(data);
+    std::pair< S3Result, sisl::byte_array > read_full_chunk(chunk_id_t, uint64_t) override {
+        return {{.status_code = 404, .error_message = "Not on NVMe"}, {}};
     }
-
-    std::pair< S3Result, sisl::byte_array > read_full_chunk(chunk_id_t chunk_id, uint64_t chunk_size) override {
-        auto it = m_chunks.find(chunk_id);
-        if (it == m_chunks.end()) {
-            return {{.status_code = 404, .error_message = "Not on NVMe"}, {}};
-        }
-        auto copy = sisl::make_byte_array(static_cast< uint32_t >(chunk_size), 0);
-        auto sz = std::min(static_cast< uint64_t >(it->second->size()), chunk_size);
-        std::memcpy(copy->bytes(), it->second->cbytes(), sz);
-        return {{.status_code = 0}, std::move(copy)};
-    }
-
-private:
-    std::unordered_map< chunk_id_t, sisl::byte_array > m_chunks;
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -144,7 +124,7 @@ private:
 };
 
 ///////////////////////////////////////////////////////////////////////////////
-// Mock NvmeDeviceIO (for TieredReadHandler)
+// Mock NvmeDeviceIO (for ChunkHydrationManager)
 ///////////////////////////////////////////////////////////////////////////////
 class MockNvmeDeviceIO : public NvmeDeviceIO {
 public:
@@ -185,6 +165,16 @@ public:
 private:
     std::unordered_map< std::string, sisl::byte_array > m_storage;
     std::set< chunk_id_t > m_on_nvme;
+};
+
+///////////////////////////////////////////////////////////////////////////////
+// Mock NvmeChunkAllocator (for ChunkHydrationManager)
+///////////////////////////////////////////////////////////////////////////////
+class MockNvmeChunkAllocator : public NvmeChunkAllocator {
+public:
+    std::error_code allocate_nvme_chunk(chunk_id_t, uint64_t) override { return {}; }
+    void release_nvme_chunk(chunk_id_t, uint64_t) override {}
+    uint64_t free_nvme_space_bytes() const override { return 1ULL << 30; }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -241,6 +231,8 @@ protected:
         m_chunk_store = std::make_shared< FullChunkStore >(m_s3_store, m_nvme_reader, m_key_mapper);
 
         m_nvme_mgr = std::make_shared< MockNvmeChunkManager >();
+        m_nvme_io = std::make_shared< MockNvmeDeviceIO >();
+        m_nvme_alloc = std::make_shared< MockNvmeChunkAllocator >();
 
         m_s3_pdev = std::make_unique< S3PhysicalDev >(
             1, m_chunk_store, m_s3_store, m_volume_id, 1024, nullptr);
@@ -254,6 +246,12 @@ protected:
         return std::make_unique< OnDemandRecoveryManager >(
             m_chunk_store, m_s3_store, m_nvme_writer, m_eviction_mgr,
             m_volume_id, retry_count, retry_backoff_ms);
+    }
+
+    std::shared_ptr< ChunkHydrationManager > make_hydration_mgr() {
+        return std::make_shared< ChunkHydrationManager >(
+            m_chunk_store, m_nvme_io, m_nvme_alloc, m_eviction_mgr,
+            nullptr, /*num_workers=*/1);
     }
 
     void setup_s3_data() {
@@ -274,6 +272,8 @@ protected:
     S3KeyMapper m_key_mapper;
     std::shared_ptr< FullChunkStore > m_chunk_store;
     std::shared_ptr< MockNvmeChunkManager > m_nvme_mgr;
+    std::shared_ptr< MockNvmeDeviceIO > m_nvme_io;
+    std::shared_ptr< MockNvmeChunkAllocator > m_nvme_alloc;
     std::unique_ptr< S3PhysicalDev > m_s3_pdev;
     std::shared_ptr< ChunkEvictionManager > m_eviction_mgr;
 };
@@ -314,7 +314,7 @@ TEST_F(OnDemandRecoveryTest, RecoverEssentialChunksSucceeds) {
     EXPECT_GT(result.elapsed.count(), 0);
 }
 
-TEST_F(OnDemandRecoveryTest, EssentialChunksWrittenToNvme) {
+TEST_F(OnDemandRecoveryTest, OnlyEssentialChunksWrittenToNvme) {
     m_nvme_writer->set_nvme_state(NvmeState::EMPTY);
     setup_s3_data();
 
@@ -323,9 +323,16 @@ TEST_F(OnDemandRecoveryTest, EssentialChunksWrittenToNvme) {
     auto result = mgr->recover_essential_chunks();
     ASSERT_TRUE(result.success);
 
+    // Essential chunks written
     EXPECT_TRUE(m_nvme_writer->has_chunk(1));
     EXPECT_TRUE(m_nvme_writer->has_chunk(2));
     EXPECT_TRUE(m_nvme_writer->has_chunk(3));
+
+    // Data chunks NOT written — this is the critical fix
+    EXPECT_FALSE(m_nvme_writer->has_chunk(10));
+    EXPECT_FALSE(m_nvme_writer->has_chunk(11));
+    EXPECT_FALSE(m_nvme_writer->has_chunk(12));
+    EXPECT_EQ(m_nvme_writer->written_count(), 3u);
 }
 
 TEST_F(OnDemandRecoveryTest, DataChunksMarkedAsEvicted) {
@@ -361,7 +368,7 @@ TEST_F(OnDemandRecoveryTest, EssentialChunkFailureAbortsRecovery) {
     auto sb = make_test_superblock(m_volume_id);
     sb.write_to_s3(*m_s3_store, m_volume_id);
 
-    // Populate only WAL and INDEX chunks — METABLK missing will cause failure
+    // Populate only WAL and INDEX — METABLK missing will cause failure
     for (const auto& entry : sb.chunks()) {
         if (entry.chunk_type == S3ChunkType::METABLK) continue;
         auto data = make_patterned_data(static_cast< uint32_t >(entry.chunk_size));
@@ -416,20 +423,17 @@ TEST_F(OnDemandRecoveryTest, ProactiveHydrationHydratesDataChunks) {
     ASSERT_TRUE(result.success);
     ASSERT_EQ(mgr->deferred_remaining(), 3u);
 
-    auto nvme_io = std::make_shared< MockNvmeDeviceIO >();
-    auto tiered_reader = std::make_shared< TieredReadHandler >(
-        m_s3_pdev.get(), nvme_io, TieredReadConfig{.s3_read_fallback_enabled = true,
-                                                    .s3_hydrate_on_read = true});
+    auto hydration_mgr = make_hydration_mgr();
 
     ProactiveHydrationConfig hydration_cfg{.interval_ms = 10, .batch_size = 2};
-    mgr->start_proactive_hydration(tiered_reader, hydration_cfg);
+    mgr->start_proactive_hydration(hydration_mgr, hydration_cfg);
 
-    // Wait for hydration to complete (bounded loop)
     for (int i = 0; i < 200 && mgr->deferred_remaining() > 0; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
     mgr->stop_proactive_hydration();
+    hydration_mgr->shutdown();
 
     EXPECT_EQ(mgr->deferred_remaining(), 0u);
     EXPECT_EQ(mgr->hydrated_count(), 3u);
@@ -445,18 +449,15 @@ TEST_F(OnDemandRecoveryTest, ProactiveHydrationStopsCleanly) {
     auto result = mgr->recover_essential_chunks();
     ASSERT_TRUE(result.success);
 
-    auto nvme_io = std::make_shared< MockNvmeDeviceIO >();
-    auto tiered_reader = std::make_shared< TieredReadHandler >(
-        m_s3_pdev.get(), nvme_io, TieredReadConfig{.s3_read_fallback_enabled = true,
-                                                    .s3_hydrate_on_read = true});
+    auto hydration_mgr = make_hydration_mgr();
 
-    // Use a very long interval so hydration won't finish on its own
     ProactiveHydrationConfig hydration_cfg{.interval_ms = 60000, .batch_size = 1};
-    mgr->start_proactive_hydration(tiered_reader, hydration_cfg);
+    mgr->start_proactive_hydration(hydration_mgr, hydration_cfg);
 
     EXPECT_TRUE(mgr->is_hydration_running());
 
     mgr->stop_proactive_hydration();
+    hydration_mgr->shutdown();
     EXPECT_FALSE(mgr->is_hydration_running());
 }
 
@@ -468,16 +469,15 @@ TEST_F(OnDemandRecoveryTest, DoubleStartHydrationIsIdempotent) {
     mgr->needs_recovery();
     mgr->recover_essential_chunks();
 
-    auto nvme_io = std::make_shared< MockNvmeDeviceIO >();
-    auto tiered_reader = std::make_shared< TieredReadHandler >(
-        m_s3_pdev.get(), nvme_io);
+    auto hydration_mgr = make_hydration_mgr();
 
     ProactiveHydrationConfig cfg{.interval_ms = 60000, .batch_size = 1};
-    mgr->start_proactive_hydration(tiered_reader, cfg);
-    mgr->start_proactive_hydration(tiered_reader, cfg); // should be a no-op
+    mgr->start_proactive_hydration(hydration_mgr, cfg);
+    mgr->start_proactive_hydration(hydration_mgr, cfg); // no-op
 
     EXPECT_TRUE(mgr->is_hydration_running());
     mgr->stop_proactive_hydration();
+    hydration_mgr->shutdown();
 }
 
 TEST_F(OnDemandRecoveryTest, RecoverWithoutPriorNeedsRecoveryCheck) {
@@ -485,10 +485,8 @@ TEST_F(OnDemandRecoveryTest, RecoverWithoutPriorNeedsRecoveryCheck) {
     setup_s3_data();
 
     auto mgr = make_manager();
-    // Call recover_essential_chunks directly — should still work
     auto result = mgr->recover_essential_chunks();
 
-    // The underlying S3RecoveryManager loads superblock on-demand
     ASSERT_TRUE(result.success) << result.error_message;
 }
 

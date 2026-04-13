@@ -27,11 +27,11 @@
 #include <sisl/metrics/metrics.hpp>
 
 #include <homestore/s3/chunk_eviction_manager.h>
+#include <homestore/s3/chunk_hydration_manager.h>
 #include <homestore/s3/chunk_store.h>
 #include <homestore/s3/pdev_s3_superblock.h>
 #include <homestore/s3/s3_object_store.h>
 #include <homestore/s3/s3_recovery.h>
-#include <homestore/s3/tiered_read_handler.h>
 
 namespace homestore {
 
@@ -103,7 +103,7 @@ public:
 
     OnDemandRecoveryResult recover_essential_chunks();
 
-    void start_proactive_hydration(std::shared_ptr< TieredReadHandler > tiered_reader,
+    void start_proactive_hydration(std::shared_ptr< ChunkHydrationManager > hydration_mgr,
                                    ProactiveHydrationConfig config = {});
 
     void stop_proactive_hydration();
@@ -119,7 +119,7 @@ public:
     OnDemandRecoveryMetrics& metrics() { return m_metrics; }
 
 private:
-    void hydration_loop(std::shared_ptr< TieredReadHandler > tiered_reader,
+    void hydration_loop(std::shared_ptr< ChunkHydrationManager > hydration_mgr,
                         ProactiveHydrationConfig config);
 
     std::unique_ptr< S3RecoveryManager > m_recovery_mgr;

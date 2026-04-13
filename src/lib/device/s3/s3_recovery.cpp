@@ -156,6 +156,92 @@ RecoveryResult S3RecoveryManager::recover_from_s3() {
     return result;
 }
 
+RecoveryResult S3RecoveryManager::recover_essential_only() {
+    auto start_time = std::chrono::steady_clock::now();
+
+    RecoveryResult result;
+
+    if (!m_superblock_loaded && !load_superblock()) {
+        result.error_message = "Failed to load pdev_s3 superblock from S3";
+        LOGERRORMOD(s3, "{}", result.error_message);
+        return result;
+    }
+
+    static constexpr std::array< S3ChunkType, 3 > ESSENTIAL_ORDER = {
+        S3ChunkType::METABLK, S3ChunkType::WAL, S3ChunkType::INDEX};
+
+    static constexpr std::array< const char*, 3 > TYPE_NAMES = {"METABLK", "WAL", "INDEX"};
+
+    uint64_t essential_total = 0;
+    for (auto type : ESSENTIAL_ORDER) {
+        essential_total += m_superblock.get_chunks_by_type(type).size();
+    }
+
+    result.total_chunks = essential_total;
+
+    if (essential_total == 0) {
+        result.success = true;
+        LOGINFO("S3 essential recovery: no essential chunks to recover");
+        return result;
+    }
+
+    LOGINFO("S3 essential recovery starting: {} essential chunks, generation={}",
+            essential_total, m_superblock.generation());
+
+    COUNTER_INCREMENT(m_metrics, recovery_chunks_total, essential_total);
+
+    for (size_t phase = 0; phase < ESSENTIAL_ORDER.size(); ++phase) {
+        auto type = ESSENTIAL_ORDER[phase];
+        auto entries = m_superblock.get_chunks_by_type(type);
+
+        if (entries.empty()) continue;
+
+        LOGINFO("S3 essential recovery phase {}/3 ({}): {} chunks",
+                phase + 1, TYPE_NAMES[phase], entries.size());
+
+        for (const auto* entry : entries) {
+            auto cr = recover_single_chunk(*entry);
+            if (cr.success) {
+                result.chunks_recovered++;
+                result.total_bytes += cr.bytes_downloaded;
+                COUNTER_INCREMENT(m_metrics, recovery_chunks_succeeded, 1);
+                COUNTER_INCREMENT(m_metrics, recovery_bytes_downloaded, cr.bytes_downloaded);
+            } else {
+                result.chunks_failed++;
+                COUNTER_INCREMENT(m_metrics, recovery_chunks_failed, 1);
+            }
+            result.chunk_results.push_back(std::move(cr));
+        }
+
+        if (result.chunks_failed > 0) {
+            result.error_message = fmt::format(
+                "Essential {} chunk recovery failed — aborting", TYPE_NAMES[phase]);
+            LOGERRORMOD(s3, "{}", result.error_message);
+            break;
+        }
+    }
+
+    auto elapsed = std::chrono::duration_cast< std::chrono::milliseconds >(
+        std::chrono::steady_clock::now() - start_time);
+    result.elapsed = elapsed;
+
+    HISTOGRAM_OBSERVE(m_metrics, recovery_total_latency_ms, elapsed.count());
+
+    result.success = (result.chunks_failed == 0);
+
+    if (result.success) {
+        LOGINFO("S3 essential recovery complete: {}/{} chunks, {} bytes, {} ms (DATA skipped)",
+                result.chunks_recovered, result.total_chunks,
+                result.total_bytes, elapsed.count());
+    } else {
+        LOGERRORMOD(s3, "S3 essential recovery failed: {}/{} recovered, {} failed, {} ms — {}",
+                    result.chunks_recovered, result.total_chunks,
+                    result.chunks_failed, elapsed.count(), result.error_message);
+    }
+
+    return result;
+}
+
 ChunkRecoveryResult S3RecoveryManager::recover_single_chunk(const s3_chunk_entry& entry) {
     ChunkRecoveryResult result;
     result.chunk_id = entry.chunk_id;
