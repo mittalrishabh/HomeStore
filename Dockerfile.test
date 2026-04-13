@@ -1,0 +1,81 @@
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV CONAN_NON_INTERACTIVE=1
+
+RUN apt-get update && apt-get install -y \
+    build-essential \
+    cmake \
+    git \
+    python3 \
+    python3-pip \
+    python3-venv \
+    python3-pyelftools \
+    libaio-dev \
+    pkg-config \
+    curl \
+    autoconf \
+    automake \
+    libtool \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --break-system-packages conan pyelftools
+
+RUN conan profile detect --force && \
+    sed -i 's,compiler.libcxx=libstdc++$,compiler.libcxx=libstdc++11,g' ~/.conan2/profiles/default && \
+    sed -i 's,compiler.cppstd=.*$,compiler.cppstd=20,g' ~/.conan2/profiles/default
+
+WORKDIR /deps
+
+RUN git clone --depth 1 https://github.com/eBay/sisl.git && \
+    git clone --depth 1 https://github.com/eBay/iomanager.git && \
+    git clone --depth 1 https://github.com/eBay/nuraft_mesg.git
+
+# Patch: replace eBay-internal libunwind/1.8.2@baydb/develop with public version
+RUN sed -i 's|self.requires("libunwind/1.8.2@baydb/develop", override=True)|self.requires("libunwind/1.8.3", override=True)|' \
+        /deps/sisl/conanfile.py \
+        /deps/iomanager/conanfile.py && \
+    (grep -q "libunwind/1.8.2@baydb/develop" /deps/nuraft_mesg/conanfile.py 2>/dev/null && \
+     sed -i 's|self.requires("libunwind/1.8.2@baydb/develop", override=True)|self.requires("libunwind/1.8.3", override=True)|' \
+         /deps/nuraft_mesg/conanfile.py || true)
+
+# Export ALL 3rd-party recipes (sisl, iomanager, nuraft_mesg vendors)
+RUN cd /deps/sisl/3rd_party/folly && conan export . --version=nu2.2023.12.18.00 && \
+    cd /deps/sisl/3rd_party/userspace-rcu && conan export . --version=nu2.0.14.0 && \
+    cd /deps/iomanager/3rd_party/pistache && conan export . --version=nbi.0.0.5.1 && \
+    cd /deps/nuraft_mesg/3rd_party/nuraft && conan export . --version=2.4.9 && \
+    cd /deps/nuraft_mesg/3rd_party/forestdb && conan export . --version=cci.20250315 && \
+    cd /deps/nuraft_mesg/3rd_party/jungle && conan export . --version=cci.20250316
+
+# Export main recipes
+RUN cd /deps/sisl && conan export --user oss --channel master . && \
+    cd /deps/iomanager && conan export --user oss --channel master . && \
+    cd /deps/nuraft_mesg && conan export --user oss --channel main .
+
+WORKDIR /homestore
+COPY . .
+
+# Add libunwind override to HomeStore conanfile for ARM builds
+RUN grep -q "libunwind" conanfile.py || \
+    sed -i '/self.requires("sisl/a\        if not self.settings.arch in ["x86", "x86_64"]:\n            self.requires("libunwind/1.8.3", override=True)' conanfile.py
+
+RUN conan install \
+    -o sisl/*:malloc_impl=libc \
+    -o iomgr/*:testing=off \
+    -o iomgr/*:prerelease=False \
+    -o homestore/*:testing=epoll_mode \
+    -s:h build_type=Debug \
+    --build missing \
+    .
+
+RUN conan build \
+    -o sisl/*:malloc_impl=libc \
+    -o iomgr/*:testing=off \
+    -o iomgr/*:prerelease=False \
+    -o homestore/*:testing=epoll_mode \
+    -s:h build_type=Debug \
+    --build missing \
+    .
+
+WORKDIR /homestore/build/Debug
+RUN ctest -R "S3|ChunkEviction|ChunkHydration|EvictionPolicy|OnDemandRecovery|TieredRead|Integ" --output-on-failure -j4

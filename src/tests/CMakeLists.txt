@@ -230,6 +230,12 @@ endif()
         target_link_libraries(test_aws_s3_object_store homestore $<TARGET_OBJECTS:hs_s3_aws> ${COMMON_TEST_DEPS} GTest::gmock ${AWSSDK_LINK_LIBRARIES})
         add_test(NAME AwsS3ObjectStore COMMAND test_aws_s3_object_store)
         set_tests_properties(AwsS3ObjectStore PROPERTIES TIMEOUT 120)
+
+        add_executable(test_s3_minio_smoke)
+        target_sources(test_s3_minio_smoke PRIVATE test_s3_minio_smoke.cpp)
+        target_link_libraries(test_s3_minio_smoke homestore $<TARGET_OBJECTS:hs_s3_aws> ${COMMON_TEST_DEPS} GTest::gmock ${AWSSDK_LINK_LIBRARIES})
+        add_test(NAME S3MinioSmoke COMMAND test_s3_minio_smoke)
+        set_tests_properties(S3MinioSmoke PROPERTIES TIMEOUT 120)
     endif()
 
 is_non_coverage_build(non_coverage_build)
