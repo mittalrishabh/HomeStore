@@ -15,6 +15,6 @@ target_sources(hs_device PRIVATE
       s3/s3_physical_dev.cpp
       s3/s3_cp.cpp
       s3/tiered_read_handler.cpp
-      s3/chunk_eviction_manager.cpp
+      s3/s3_recovery.cpp
     )
 target_link_libraries(hs_device hs_common ${COMMON_DEPS})
