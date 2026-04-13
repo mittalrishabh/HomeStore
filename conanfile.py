@@ -25,6 +25,7 @@ class HomestoreConan(ConanFile):
                 "coverage": ['True', 'False'],
                 "sanitize": ['True', 'False'],
                 "testing" : ['full', 'min', 'off', 'epoll_mode', 'spdk_mode'],
+                "with_minio_tests": ['True', 'False'],
             }
     default_options = {
                 'shared':       False,
@@ -32,6 +33,7 @@ class HomestoreConan(ConanFile):
                 'coverage':     False,
                 'sanitize':     False,
                 'testing':      'epoll_mode',
+                'with_minio_tests': False,
             }
 
     exports_sources = "cmake/*", "src/*", "CMakeLists.txt", "test_wrap.sh", "LICENSE"
@@ -63,6 +65,9 @@ class HomestoreConan(ConanFile):
         # Tests require OpenSSL 3.x
         self.requires("openssl/[^3.1]", override=True)
 
+        if self.options.with_minio_tests:
+            self.requires("aws-sdk-cpp/1.11.352", transitive_headers=True)
+
     def imports(self):
         self.copy(root_package="sisl", pattern="*", dst="bin/scripts/python/flip/", src="bindings/flip/python/", keep_path=False)
 
@@ -92,6 +97,8 @@ class HomestoreConan(ConanFile):
         tc = CMakeToolchain(self)
         if self.options.testing != "off":
             tc.variables["TEST_TARGET"] = self.options.testing
+        if self.options.with_minio_tests:
+            tc.variables["ENABLE_MINIO_TESTS"] = "ON"
         tc.variables["CONAN_CMAKE_SILENT_OUTPUT"] = "ON"
         tc.variables['CMAKE_EXPORT_COMPILE_COMMANDS'] = 'ON'
         tc.variables["CTEST_OUTPUT_ON_FAILURE"] = "ON"

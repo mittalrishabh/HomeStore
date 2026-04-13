@@ -7,3 +7,12 @@ target_sources(hs_s3 PRIVATE
     nvme_superblock_fallback.cpp
 )
 target_link_libraries(hs_s3 hs_common ${COMMON_DEPS})
+
+if (ENABLE_MINIO_TESTS)
+    find_package(AWSSDK REQUIRED COMPONENTS s3)
+    add_library(hs_s3_aws OBJECT)
+    target_sources(hs_s3_aws PRIVATE
+        aws_s3_object_store.cpp
+    )
+    target_link_libraries(hs_s3_aws hs_common ${COMMON_DEPS} ${AWSSDK_LINK_LIBRARIES})
+endif()
