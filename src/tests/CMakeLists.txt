@@ -187,6 +187,12 @@ endif()
     target_link_libraries(test_chunk_hydration homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME ChunkHydration COMMAND test_chunk_hydration)
 
+    # LRU Eviction Policy tests (Task 3.4)
+    add_executable(test_lru_eviction_policy)
+    target_sources(test_lru_eviction_policy PRIVATE test_lru_eviction_policy.cpp)
+    target_link_libraries(test_lru_eviction_policy homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME LruEvictionPolicy COMMAND test_lru_eviction_policy)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)

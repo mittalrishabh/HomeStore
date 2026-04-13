@@ -346,6 +346,12 @@ table S3 {
 
     // Number of background hydration worker threads
     hydration_workers: uint32 = 1;
+
+    // Eviction policy: "lru" (default), "fifo"
+    eviction_policy: string;        // default: "lru" (set in code)
+
+    // NVMe capacity threshold — trigger eviction when usage exceeds this fraction
+    nvme_capacity_threshold: float = 0.9;
 }
 
 table HomeStoreSettings {
