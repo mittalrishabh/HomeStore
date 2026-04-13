@@ -165,6 +165,14 @@ public:
      */
     RecoveryResult recover_from_s3();
 
+    /**
+     * @brief Recover only essential chunks (METABLK, WAL, INDEX) — skip DATA.
+     *
+     * Used by OnDemandRecoveryManager for fast startup. Data chunks are left
+     * on S3 and served via TieredReadHandler until proactively hydrated.
+     */
+    RecoveryResult recover_essential_only();
+
     /// Get the loaded superblock (valid after needs_recovery() or recover_from_s3())
     const PdevS3Superblock& superblock() const { return m_superblock; }
 
