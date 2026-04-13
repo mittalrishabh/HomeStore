@@ -168,7 +168,7 @@ private:
     mutable std::mutex m_states_mutex;
     std::unordered_map< chunk_id_t, std::unique_ptr< ChunkState > > m_chunk_states;
 
-    ChunkEvictionMetrics m_metrics;
+    mutable ChunkEvictionMetrics m_metrics;
 };
 
 } // namespace homestore

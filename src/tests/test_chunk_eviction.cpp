@@ -339,7 +339,7 @@ TEST_F(ChunkEvictionTest, WriteBlockedDuringEviction) {
     ASSERT_TRUE(m_eviction_mgr->is_chunk_evicted(CHUNK_ID));
 }
 
-TEST_F(ChunkEvictionTest, MarkHydratedRestorescChunk) {
+TEST_F(ChunkEvictionTest, MarkHydratedRestoresChunk) {
     constexpr chunk_id_t CHUNK_ID = 80;
     setup_chunk_on_both(CHUNK_ID);
 

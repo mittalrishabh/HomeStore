@@ -139,7 +139,7 @@ bool ChunkEvictionManager::is_write_blocked(chunk_id_t chunk_id) const {
 
     std::shared_lock lock{state->mtx};
     if (state->state == ChunkEvictionState::EVICTING) {
-        COUNTER_INCREMENT(const_cast< ChunkEvictionMetrics& >(m_metrics), writes_blocked_by_eviction, 1);
+        COUNTER_INCREMENT(m_metrics, writes_blocked_by_eviction, 1);
         return true;
     }
     return false;
