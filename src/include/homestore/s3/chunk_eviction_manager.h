@@ -35,7 +35,6 @@ enum class EvictionResult : uint8_t {
     NOT_ON_S3,
     ALREADY_EVICTED,
     EVICTION_IN_PROGRESS,
-    HAS_DIRTY_DATA,
     FLUSH_FAILED,
     INTERNAL_ERROR
 };

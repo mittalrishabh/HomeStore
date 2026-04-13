@@ -411,7 +411,6 @@ TEST_F(ChunkEvictionTest, EvictionResultToString) {
     ASSERT_EQ(to_string(EvictionResult::NOT_ON_S3), "NOT_ON_S3");
     ASSERT_EQ(to_string(EvictionResult::ALREADY_EVICTED), "ALREADY_EVICTED");
     ASSERT_EQ(to_string(EvictionResult::EVICTION_IN_PROGRESS), "EVICTION_IN_PROGRESS");
-    ASSERT_EQ(to_string(EvictionResult::HAS_DIRTY_DATA), "HAS_DIRTY_DATA");
     ASSERT_EQ(to_string(EvictionResult::FLUSH_FAILED), "FLUSH_FAILED");
     ASSERT_EQ(to_string(EvictionResult::INTERNAL_ERROR), "INTERNAL_ERROR");
 }

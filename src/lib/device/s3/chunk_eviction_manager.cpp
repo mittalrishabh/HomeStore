@@ -27,7 +27,6 @@ std::string to_string(EvictionResult r) {
     case EvictionResult::NOT_ON_S3: return "NOT_ON_S3";
     case EvictionResult::ALREADY_EVICTED: return "ALREADY_EVICTED";
     case EvictionResult::EVICTION_IN_PROGRESS: return "EVICTION_IN_PROGRESS";
-    case EvictionResult::HAS_DIRTY_DATA: return "HAS_DIRTY_DATA";
     case EvictionResult::FLUSH_FAILED: return "FLUSH_FAILED";
     case EvictionResult::INTERNAL_ERROR: return "INTERNAL_ERROR";
     }
