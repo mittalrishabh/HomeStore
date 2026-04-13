@@ -181,6 +181,12 @@ endif()
     target_link_libraries(test_s3_recovery homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME S3Recovery COMMAND test_s3_recovery)
 
+    # Chunk Hydration — Cache-on-Read tests (Task 3.2)
+    add_executable(test_chunk_hydration)
+    target_sources(test_chunk_hydration PRIVATE test_chunk_hydration.cpp)
+    target_link_libraries(test_chunk_hydration homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME ChunkHydration COMMAND test_chunk_hydration)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)

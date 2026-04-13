@@ -15,6 +15,7 @@
 
 #include <chrono>
 
+#include <homestore/s3/chunk_hydration_manager.h>
 #include <homestore/s3/tiered_read_handler.h>
 
 SISL_LOGGING_DECL(s3)
@@ -23,8 +24,9 @@ namespace homestore {
 
 TieredReadHandler::TieredReadHandler(S3PhysicalDev* s3_pdev,
                                      std::shared_ptr< NvmeDeviceIO > nvme_io,
-                                     TieredReadConfig config)
-    : m_s3_pdev{s3_pdev}, m_nvme_io{std::move(nvme_io)}, m_config{config} {
+                                     TieredReadConfig config,
+                                     std::shared_ptr< ChunkHydrationManager > hydration_mgr)
+    : m_s3_pdev{s3_pdev}, m_nvme_io{std::move(nvme_io)}, m_hydration_mgr{std::move(hydration_mgr)}, m_config{config} {
     RELEASE_ASSERT(m_s3_pdev != nullptr, "S3PhysicalDev must not be null");
     RELEASE_ASSERT(m_nvme_io != nullptr, "NvmeDeviceIO must not be null");
     LOGDEBUGMOD(s3, "TieredReadHandler created: fallback={} hydrate={}",
@@ -100,22 +102,33 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
 
             // Optional: hydrate to NVMe for fast subsequent reads
             if (cfg.s3_hydrate_on_read && data) {
-                auto hydrate_start = std::chrono::steady_clock::now();
-                auto write_ec = m_nvme_io->nvme_write(
-                    chunk_id, offset_in_chunk,
-                    reinterpret_cast< const char* >(data->cbytes()), data->size());
-                auto hydrate_us = std::chrono::duration_cast< std::chrono::microseconds >(
-                    std::chrono::steady_clock::now() - hydrate_start).count();
-                HISTOGRAM_OBSERVE(m_metrics, s3_hydrate_latency_us, hydrate_us);
-
-                if (!write_ec) {
-                    COUNTER_INCREMENT(m_metrics, s3_hydrate_count, 1);
-                    LOGDEBUGMOD(s3, "Tiered read: hydrated chunk_id={} offset={} size={} to NVMe ({}us)",
-                                chunk_id, offset_in_chunk, data->size(), hydrate_us);
+                if (m_hydration_mgr) {
+                    auto chunk_entry = m_s3_pdev->superblock().find_chunk(chunk_id);
+                    if (chunk_entry) {
+                        m_hydration_mgr->schedule_hydration(chunk_id, chunk_entry->chunk_size);
+                    } else {
+                        LOGWARNMOD(s3, "Tiered read: skipping hydration for chunk_id={} — no superblock entry",
+                                   chunk_id);
+                    }
                 } else {
-                    COUNTER_INCREMENT(m_metrics, s3_hydrate_failures, 1);
-                    LOGWARNMOD(s3, "Tiered read: NVMe hydration failed for chunk_id={}: {}",
-                               chunk_id, write_ec.message());
+                    // Fallback: inline block-level write (legacy path)
+                    auto hydrate_start = std::chrono::steady_clock::now();
+                    auto write_ec = m_nvme_io->nvme_write(
+                        chunk_id, offset_in_chunk,
+                        reinterpret_cast< const char* >(data->cbytes()), data->size());
+                    auto hydrate_us = std::chrono::duration_cast< std::chrono::microseconds >(
+                        std::chrono::steady_clock::now() - hydrate_start).count();
+                    HISTOGRAM_OBSERVE(m_metrics, s3_hydrate_latency_us, hydrate_us);
+
+                    if (!write_ec) {
+                        COUNTER_INCREMENT(m_metrics, s3_hydrate_count, 1);
+                        LOGDEBUGMOD(s3, "Tiered read: hydrated chunk_id={} offset={} size={} to NVMe ({}us)",
+                                    chunk_id, offset_in_chunk, data->size(), hydrate_us);
+                    } else {
+                        COUNTER_INCREMENT(m_metrics, s3_hydrate_failures, 1);
+                        LOGWARNMOD(s3, "Tiered read: NVMe hydration failed for chunk_id={}: {}",
+                                   chunk_id, write_ec.message());
+                    }
                 }
             }
 
@@ -211,22 +224,32 @@ TieredReadHandler::read_from_s3_and_hydrate(chunk_id_t chunk_id, uint64_t offset
 
     COUNTER_INCREMENT(m_metrics, s3_read_fallback_count, 1);
 
-    // Optional hydration (uses caller's config snapshot via member — sync path only)
+    // Optional hydration
     auto cfg = config();
     if (cfg.s3_hydrate_on_read && data) {
-        auto hydrate_start = std::chrono::steady_clock::now();
-        auto write_ec = m_nvme_io->nvme_write(
-            chunk_id, offset_in_chunk,
-            reinterpret_cast< const char* >(data->cbytes()), data->size());
-        auto hydrate_us = std::chrono::duration_cast< std::chrono::microseconds >(
-            std::chrono::steady_clock::now() - hydrate_start).count();
-        HISTOGRAM_OBSERVE(m_metrics, s3_hydrate_latency_us, hydrate_us);
-
-        if (!write_ec) {
-            COUNTER_INCREMENT(m_metrics, s3_hydrate_count, 1);
+        if (m_hydration_mgr) {
+            auto chunk_entry = m_s3_pdev->superblock().find_chunk(chunk_id);
+            if (chunk_entry) {
+                m_hydration_mgr->schedule_hydration(chunk_id, chunk_entry->chunk_size);
+            } else {
+                LOGWARNMOD(s3, "Tiered sync_read: skipping hydration for chunk_id={} — no superblock entry",
+                           chunk_id);
+            }
         } else {
-            COUNTER_INCREMENT(m_metrics, s3_hydrate_failures, 1);
-            LOGWARNMOD(s3, "Tiered sync_read: hydration failed for chunk_id={}", chunk_id);
+            auto hydrate_start = std::chrono::steady_clock::now();
+            auto write_ec = m_nvme_io->nvme_write(
+                chunk_id, offset_in_chunk,
+                reinterpret_cast< const char* >(data->cbytes()), data->size());
+            auto hydrate_us = std::chrono::duration_cast< std::chrono::microseconds >(
+                std::chrono::steady_clock::now() - hydrate_start).count();
+            HISTOGRAM_OBSERVE(m_metrics, s3_hydrate_latency_us, hydrate_us);
+
+            if (!write_ec) {
+                COUNTER_INCREMENT(m_metrics, s3_hydrate_count, 1);
+            } else {
+                COUNTER_INCREMENT(m_metrics, s3_hydrate_failures, 1);
+                LOGWARNMOD(s3, "Tiered sync_read: hydration failed for chunk_id={}", chunk_id);
+            }
         }
     }
 

@@ -33,6 +33,8 @@
 
 namespace homestore {
 
+class ChunkHydrationManager;
+
 /**
  * @brief Configuration for tiered read behavior.
  */
@@ -124,7 +126,8 @@ public:
      */
     TieredReadHandler(S3PhysicalDev* s3_pdev,
                       std::shared_ptr< NvmeDeviceIO > nvme_io,
-                      TieredReadConfig config = {});
+                      TieredReadConfig config = {},
+                      std::shared_ptr< ChunkHydrationManager > hydration_mgr = nullptr);
 
     ~TieredReadHandler() = default;
 
@@ -182,6 +185,9 @@ public:
         return m_config;
     }
 
+    /// Set the hydration manager (can be set after construction)
+    void set_hydration_manager(std::shared_ptr< ChunkHydrationManager > mgr) { m_hydration_mgr = std::move(mgr); }
+
     /// Accessors
     TieredReadMetrics& metrics() { return m_metrics; }
     S3PhysicalDev* s3_pdev() { return m_s3_pdev; }
@@ -193,6 +199,7 @@ private:
 
     S3PhysicalDev* m_s3_pdev;
     std::shared_ptr< NvmeDeviceIO > m_nvme_io;
+    std::shared_ptr< ChunkHydrationManager > m_hydration_mgr;
     mutable std::shared_mutex m_config_mtx;
     TieredReadConfig m_config;
     TieredReadMetrics m_metrics;
