@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 project(HomeStore)
 
 option(DEBUG_CMAKE "Debug CMake messages option" OFF)
+option(ENABLE_MINIO_TESTS "Build integration tests that require MinIO (aws-sdk-cpp)" OFF)
 
 # Set Global CMake Options
 set_property(GLOBAL PROPERTY USE_FOLDERS ON) # turn on folder hierarchies
