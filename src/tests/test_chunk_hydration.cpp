@@ -162,11 +162,18 @@ public:
         return {};
     }
 
+    void release_nvme_chunk(chunk_id_t chunk_id, uint64_t chunk_size) override {
+        m_allocated.erase(chunk_id);
+        m_used_space = m_used_space > chunk_size ? m_used_space - chunk_size : 0;
+        m_released.insert(chunk_id);
+    }
+
     uint64_t free_nvme_space_bytes() const override {
         return m_total_space > m_used_space ? m_total_space - m_used_space : 0;
     }
 
     bool is_allocated(chunk_id_t chunk_id) const { return m_allocated.count(chunk_id) > 0; }
+    bool was_released(chunk_id_t chunk_id) const { return m_released.count(chunk_id) > 0; }
     void set_fail_alloc(bool fail) { m_fail_alloc = fail; }
     void free_space(uint64_t bytes) { m_used_space = m_used_space > bytes ? m_used_space - bytes : 0; }
 
@@ -174,6 +181,7 @@ private:
     uint64_t m_total_space;
     uint64_t m_used_space;
     std::set< chunk_id_t > m_allocated;
+    std::set< chunk_id_t > m_released;
     bool m_fail_alloc{false};
 };
 
@@ -331,6 +339,10 @@ TEST_F(ChunkHydrationTest, SyncHydrationNvmeWriteFails) {
 
     auto result = m_hydration_mgr->hydrate_sync(CHUNK_ID, CHUNK_SIZE);
     ASSERT_EQ(result, HydrationResult::NVME_WRITE_FAILED);
+
+    // Bug fix: allocated NVMe space must be released on write failure
+    ASSERT_TRUE(m_nvme_alloc->was_released(CHUNK_ID));
+    ASSERT_FALSE(m_nvme_alloc->is_allocated(CHUNK_ID));
 }
 
 TEST_F(ChunkHydrationTest, SyncHydrationNvmeFullNoSelector) {

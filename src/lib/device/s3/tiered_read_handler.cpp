@@ -103,10 +103,13 @@ TieredReadHandler::async_read(chunk_id_t chunk_id, uint64_t offset_in_chunk, uin
             // Optional: hydrate to NVMe for fast subsequent reads
             if (cfg.s3_hydrate_on_read && data) {
                 if (m_hydration_mgr) {
-                    // Async chunk-level hydration — non-blocking, returns immediately
                     auto chunk_entry = m_s3_pdev->superblock().find_chunk(chunk_id);
-                    uint64_t cs = chunk_entry ? chunk_entry->chunk_size : data->size();
-                    m_hydration_mgr->schedule_hydration(chunk_id, cs);
+                    if (chunk_entry) {
+                        m_hydration_mgr->schedule_hydration(chunk_id, chunk_entry->chunk_size);
+                    } else {
+                        LOGWARNMOD(s3, "Tiered read: skipping hydration for chunk_id={} — no superblock entry",
+                                   chunk_id);
+                    }
                 } else {
                     // Fallback: inline block-level write (legacy path)
                     auto hydrate_start = std::chrono::steady_clock::now();
@@ -226,8 +229,12 @@ TieredReadHandler::read_from_s3_and_hydrate(chunk_id_t chunk_id, uint64_t offset
     if (cfg.s3_hydrate_on_read && data) {
         if (m_hydration_mgr) {
             auto chunk_entry = m_s3_pdev->superblock().find_chunk(chunk_id);
-            uint64_t cs = chunk_entry ? chunk_entry->chunk_size : data->size();
-            m_hydration_mgr->schedule_hydration(chunk_id, cs);
+            if (chunk_entry) {
+                m_hydration_mgr->schedule_hydration(chunk_id, chunk_entry->chunk_size);
+            } else {
+                LOGWARNMOD(s3, "Tiered sync_read: skipping hydration for chunk_id={} — no superblock entry",
+                           chunk_id);
+            }
         } else {
             auto hydrate_start = std::chrono::steady_clock::now();
             auto write_ec = m_nvme_io->nvme_write(

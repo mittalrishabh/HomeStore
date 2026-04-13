@@ -178,6 +178,7 @@ HydrationResult ChunkHydrationManager::do_hydrate(chunk_id_t chunk_id, uint64_t 
                                            write_size);
     if (write_ec) {
         LOGERRORMOD(s3, "do_hydrate: NVMe write failed for chunk_id={}: {}", chunk_id, write_ec.message());
+        m_nvme_alloc->release_nvme_chunk(chunk_id, chunk_size);
         COUNTER_INCREMENT(m_metrics, hydration_nvme_write_failures, 1);
         return HydrationResult::NVME_WRITE_FAILED;
     }
@@ -197,6 +198,7 @@ HydrationResult ChunkHydrationManager::do_hydrate(chunk_id_t chunk_id, uint64_t 
     return HydrationResult::SUCCESS;
 }
 
+// TODO: loop until enough space is freed (currently evicts only one chunk)
 bool ChunkHydrationManager::ensure_nvme_space(uint64_t needed_bytes) {
     if (!m_eviction_selector) {
         LOGWARNMOD(s3, "ensure_nvme_space: no eviction selector — cannot free space");

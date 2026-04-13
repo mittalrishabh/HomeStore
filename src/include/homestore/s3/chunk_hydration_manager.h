@@ -84,6 +84,9 @@ public:
     /// Allocate NVMe space for a chunk. Returns error if NVMe is full.
     virtual std::error_code allocate_nvme_chunk(chunk_id_t chunk_id, uint64_t chunk_size) = 0;
 
+    /// Release NVMe space for a chunk (e.g. on hydration write failure).
+    virtual void release_nvme_chunk(chunk_id_t chunk_id, uint64_t chunk_size) = 0;
+
     /// Get the total free NVMe space in bytes.
     virtual uint64_t free_nvme_space_bytes() const = 0;
 };
