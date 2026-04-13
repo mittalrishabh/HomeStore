@@ -16,6 +16,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include <aws/core/Aws.h>
@@ -54,8 +55,11 @@ private:
 
     static S3Result outcome_to_result(const Aws::S3::S3Error& error);
 
+    static std::once_flag s_init_flag;
+    static std::atomic< int > s_ref_count;
+    static Aws::SDKOptions s_sdk_options;
+
     S3ObjectStoreConfig m_cfg;
-    Aws::SDKOptions m_sdk_options;
     std::shared_ptr< Aws::S3::S3Client > m_client;
     std::unique_ptr< folly::CPUThreadPoolExecutor > m_executor;
 

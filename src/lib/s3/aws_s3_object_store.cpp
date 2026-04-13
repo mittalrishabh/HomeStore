@@ -34,8 +34,13 @@
 
 namespace homestore {
 
+std::once_flag AwsS3ObjectStore::s_init_flag;
+std::atomic< int > AwsS3ObjectStore::s_ref_count{0};
+Aws::SDKOptions AwsS3ObjectStore::s_sdk_options;
+
 AwsS3ObjectStore::AwsS3ObjectStore(const S3ObjectStoreConfig& cfg) : m_cfg{cfg} {
-    Aws::InitAPI(m_sdk_options);
+    std::call_once(s_init_flag, [] { Aws::InitAPI(s_sdk_options); });
+    s_ref_count.fetch_add(1, std::memory_order_acq_rel);
 
     Aws::Client::ClientConfiguration client_cfg;
     client_cfg.region = Aws::String(m_cfg.region.begin(), m_cfg.region.end());
@@ -65,7 +70,9 @@ AwsS3ObjectStore::AwsS3ObjectStore(const S3ObjectStoreConfig& cfg) : m_cfg{cfg} 
 AwsS3ObjectStore::~AwsS3ObjectStore() {
     m_executor.reset();
     m_client.reset();
-    Aws::ShutdownAPI(m_sdk_options);
+    if (s_ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        Aws::ShutdownAPI(s_sdk_options);
+    }
 }
 
 template < typename Func >
