@@ -169,6 +169,12 @@ endif()
     target_link_libraries(test_nvme_superblock_fallback homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME NvmeSuperblockFallback COMMAND test_nvme_superblock_fallback)
 
+    # Chunk Eviction tests (Task 3.1)
+    add_executable(test_chunk_eviction)
+    target_sources(test_chunk_eviction PRIVATE test_chunk_eviction.cpp)
+    target_link_libraries(test_chunk_eviction homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME ChunkEviction COMMAND test_chunk_eviction)
+
 
 
 is_non_coverage_build(non_coverage_build)
