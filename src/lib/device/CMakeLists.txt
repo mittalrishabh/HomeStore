@@ -16,5 +16,6 @@ target_sources(hs_device PRIVATE
       s3/s3_cp.cpp
       s3/tiered_read_handler.cpp
       s3/s3_recovery.cpp
+      s3/chunk_hydration_manager.cpp
     )
 target_link_libraries(hs_device hs_common ${COMMON_DEPS})

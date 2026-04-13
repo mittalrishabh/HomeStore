@@ -340,6 +340,12 @@ table S3 {
 
     // Memory limit for dirty cache — forces early CP flush if exceeded
     dirty_cache_max_mb: uint32 = 4096;
+
+    // Hydrate evicted chunks back to NVMe on first S3 read (cache-on-read)
+    hydrate_on_read: bool = true;
+
+    // Number of background hydration worker threads
+    hydration_workers: uint32 = 1;
 }
 
 table HomeStoreSettings {
