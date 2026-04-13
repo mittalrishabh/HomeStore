@@ -100,10 +100,11 @@ static S3ObjectStoreConfig make_minio_config(const std::string& bucket) {
     return cfg;
 }
 
-static std::string make_test_bucket_name(const std::string& test_name) {
+static std::string make_unique_volume_id(const std::string& test_name) {
+    static std::atomic< uint32_t > counter{0};
     auto now = std::chrono::system_clock::now().time_since_epoch();
     auto ms = std::chrono::duration_cast< std::chrono::milliseconds >(now).count();
-    return "hs-smoke-" + test_name + "-" + std::to_string(ms);
+    return "smoke-" + test_name + "-" + std::to_string(ms) + "-" + std::to_string(counter.fetch_add(1));
 }
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -296,14 +297,14 @@ static std::shared_ptr< S3ObjectStore > create_minio_store(const std::string& bu
 ///////////////////////////////////////////////////////////////////////////////
 class S3MinioSmokeTest : public ::testing::Test {
 protected:
+    static constexpr const char* SHARED_BUCKET = "homestore-test";
+
     void SetUp() override {
-        m_volume_id = "vol-smoke-test";
-        m_key_mapper = S3KeyMapper{m_volume_id};
+        m_s3_store = create_minio_store(SHARED_BUCKET);
     }
 
     void TearDown() override {
-        // Best-effort cleanup: delete all objects under our prefix
-        if (m_s3_store) {
+        if (m_s3_store && !m_volume_id.empty()) {
             auto list_result = m_s3_store->list_objects(m_volume_id + "/").get();
             if (list_result.result.ok()) {
                 std::vector< std::string > keys;
@@ -317,14 +318,12 @@ protected:
         }
     }
 
-    std::shared_ptr< S3ObjectStore > make_store(const std::string& test_name) {
-        m_bucket = make_test_bucket_name(test_name);
-        m_s3_store = create_minio_store(m_bucket);
-        return m_s3_store;
+    void init_test(const std::string& test_name) {
+        m_volume_id = make_unique_volume_id(test_name);
+        m_key_mapper = S3KeyMapper{m_volume_id};
     }
 
     std::string m_volume_id;
-    std::string m_bucket;
     S3KeyMapper m_key_mapper;
     std::shared_ptr< S3ObjectStore > m_s3_store;
 };
@@ -333,10 +332,10 @@ protected:
 // Test 1: FullChunkStore Round-Trip via real S3
 ///////////////////////////////////////////////////////////////////////////////
 TEST_F(S3MinioSmokeTest, FullChunkStoreRoundTrip) {
-    auto s3 = make_store("roundtrip");
+    init_test("roundtrip");
 
     auto nvme_reader = std::make_shared< MockNvmeChunkReader >();
-    auto chunk_store = std::make_shared< FullChunkStore >(s3, nvme_reader, m_key_mapper);
+    auto chunk_store = std::make_shared< FullChunkStore >(m_s3_store, nvme_reader, m_key_mapper);
 
     const chunk_id_t chunk_id = 42;
     auto test_data = make_patterned_data(static_cast< uint32_t >(TEST_CHUNK_SIZE), 0xDE);
@@ -365,14 +364,14 @@ TEST_F(S3MinioSmokeTest, FullChunkStoreRoundTrip) {
 // Test 2: CP Flush to MinIO
 ///////////////////////////////////////////////////////////////////////////////
 TEST_F(S3MinioSmokeTest, CpFlushToMinIO) {
-    auto s3 = make_store("cpflush");
+    init_test("cpflush");
 
     auto nvme_reader = std::make_shared< MockNvmeChunkReader >();
-    auto chunk_store = std::make_shared< FullChunkStore >(s3, nvme_reader, m_key_mapper);
+    auto chunk_store = std::make_shared< FullChunkStore >(m_s3_store, nvme_reader, m_key_mapper);
     auto cp_flush_cb = std::make_shared< MockCpFlushCallback >();
 
     const uint32_t pdev_id = 1;
-    S3PhysicalDev pdev(pdev_id, chunk_store, s3, m_volume_id, 4096, cp_flush_cb);
+    S3PhysicalDev pdev(pdev_id, chunk_store, m_s3_store, m_volume_id, 4096, cp_flush_cb);
 
     const chunk_id_t chunk_id = 100;
     pdev.create_chunk(chunk_id, TEST_CHUNK_SIZE, S3ChunkType::DATA, /*vdev_id=*/0);
@@ -395,15 +394,14 @@ TEST_F(S3MinioSmokeTest, CpFlushToMinIO) {
     auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
     EXPECT_TRUE(flush_ok);
 
-    // Verify superblock exists in MinIO
-    auto sb_key = m_volume_id + "/superblock/pdev_" + std::to_string(pdev_id) + ".sb";
-    auto [head_result, _] = s3->get_object(sb_key).get();
-    // Superblock should have been written during flush
-    // (The exact key format depends on PdevS3Superblock::write — adjust if needed)
+    // Verify superblock exists in MinIO (key format: <volume_id>/pdev_superblock.bin)
+    auto sb_key = PdevS3Superblock::s3_key(m_volume_id);
+    auto [head_result, _] = m_s3_store->get_object(sb_key).get();
+    EXPECT_TRUE(head_result.ok()) << "Superblock not found in MinIO at key: " << sb_key;
 
     // Verify chunk data exists in MinIO
     auto chunk_key = m_key_mapper.chunk_data_key(chunk_id);
-    auto [chunk_head, chunk_data] = s3->get_object(chunk_key).get();
+    auto [chunk_head, chunk_data] = m_s3_store->get_object(chunk_key).get();
     EXPECT_TRUE(chunk_head.ok()) << "Chunk not found in MinIO: " << chunk_key;
 }
 
@@ -411,12 +409,16 @@ TEST_F(S3MinioSmokeTest, CpFlushToMinIO) {
 // Test 3: Recovery from MinIO
 ///////////////////////////////////////////////////////////////////////////////
 TEST_F(S3MinioSmokeTest, RecoveryFromMinIO) {
-    auto s3 = make_store("recovery");
+    init_test("recovery");
 
     auto nvme_reader = std::make_shared< MockNvmeChunkReader >();
-    auto chunk_store = std::make_shared< FullChunkStore >(s3, nvme_reader, m_key_mapper);
+    auto chunk_store = std::make_shared< FullChunkStore >(m_s3_store, nvme_reader, m_key_mapper);
+    auto cp_flush_cb = std::make_shared< MockCpFlushCallback >();
 
-    // Pre-populate MinIO with chunk data (simulate prior CP flush)
+    const uint32_t pdev_id = 1;
+    S3PhysicalDev pdev(pdev_id, chunk_store, m_s3_store, m_volume_id, 4096, cp_flush_cb);
+
+    // Create chunks and upload via normal CP path (builds proper superblock)
     const std::vector< chunk_id_t > chunk_ids = {10, 20, 30};
     std::unordered_map< chunk_id_t, sisl::byte_array > expected_data;
 
@@ -425,31 +427,32 @@ TEST_F(S3MinioSmokeTest, RecoveryFromMinIO) {
                                         static_cast< uint8_t >(cid));
         expected_data[cid] = data;
 
-        // Upload directly via S3ObjectStore
-        auto key = m_key_mapper.chunk_data_key(cid);
-        auto blob = sisl::io_blob_safe(data->size());
-        std::memcpy(blob.bytes(), data->cbytes(), data->size());
-        auto put_r = s3->put_object(key, std::move(blob)).get();
-        ASSERT_TRUE(put_r.ok()) << "Failed to seed chunk " << cid << ": " << put_r.error_message;
+        pdev.create_chunk(cid, TEST_CHUNK_SIZE, S3ChunkType::DATA, /*vdev_id=*/0);
+        nvme_reader->set_chunk_data(cid, data);
+
+        auto put_r = chunk_store->put(cid, TEST_CHUNK_SIZE, {}).get();
+        ASSERT_TRUE(put_r.ok()) << "Failed to upload chunk " << cid << ": " << put_r.error_message;
     }
 
-    // Build and upload a superblock referencing these chunks
-    // (PdevS3Superblock serialization — we need to construct one that lists our chunks)
-    // TODO: Construct a proper PdevS3Superblock with chunk entries and upload it.
-    //       For now, we test recovery via the ChunkStore's recover() path directly.
+    // Write superblock to S3 (serializes chunk table → pdev_superblock.bin)
+    auto sb_result = pdev.write_superblock();
+    ASSERT_TRUE(sb_result.ok()) << "Superblock write failed: " << sb_result.error_message;
 
-    // Create recovery writer (simulates NVMe destination)
+    // Simulate NVMe loss
+    for (auto cid : chunk_ids) {
+        nvme_reader->remove_chunk_data(cid);
+    }
+
     auto nvme_writer = std::make_shared< MockNvmeRecoveryWriter >();
     nvme_writer->set_nvme_state(NvmeState::EMPTY);
 
-    S3RecoveryManager recovery(chunk_store, s3, nvme_writer, m_volume_id);
+    S3RecoveryManager recovery(chunk_store, m_s3_store, nvme_writer, m_volume_id);
 
-    // Recovery should detect empty NVMe
     EXPECT_TRUE(recovery.needs_recovery());
 
     auto result = recovery.recover_from_s3();
+    EXPECT_TRUE(result.success) << "Recovery failed";
 
-    // Verify all chunks were downloaded and written to NVMe
     for (auto cid : chunk_ids) {
         EXPECT_TRUE(nvme_writer->has_chunk(cid))
             << "Chunk " << cid << " not recovered to NVMe";
@@ -467,17 +470,17 @@ TEST_F(S3MinioSmokeTest, RecoveryFromMinIO) {
 // Test 4: Tiered Read Fallback to S3
 ///////////////////////////////////////////////////////////////////////////////
 TEST_F(S3MinioSmokeTest, TieredReadFallback) {
-    auto s3 = make_store("tiered");
+    init_test("tiered");
 
     auto nvme_reader = std::make_shared< MockNvmeChunkReader >();
     auto nvme_io = std::make_shared< MockNvmeDeviceIO >();
     auto nvme_mgr = std::make_shared< MockNvmeChunkManager >();
     auto nvme_alloc = std::make_shared< MockNvmeChunkAllocator >();
-    auto chunk_store = std::make_shared< FullChunkStore >(s3, nvme_reader, m_key_mapper);
+    auto chunk_store = std::make_shared< FullChunkStore >(m_s3_store, nvme_reader, m_key_mapper);
     auto cp_flush_cb = std::make_shared< MockCpFlushCallback >();
 
     const uint32_t pdev_id = 1;
-    S3PhysicalDev pdev(pdev_id, chunk_store, s3, m_volume_id, 4096, cp_flush_cb);
+    S3PhysicalDev pdev(pdev_id, chunk_store, m_s3_store, m_volume_id, 4096, cp_flush_cb);
 
     const chunk_id_t chunk_id = 55;
     pdev.create_chunk(chunk_id, TEST_CHUNK_SIZE, S3ChunkType::DATA, /*vdev_id=*/0);
@@ -527,9 +530,7 @@ TEST_F(S3MinioSmokeTest, ErrorHandling) {
 
     // Sub-test B: Missing key in valid bucket → 404
     {
-        auto s3 = make_store("errorhandling");
-
-        auto [result, data] = s3->get_object("this/key/does/not/exist").get();
+        auto [result, data] = m_s3_store->get_object("this/key/does/not/exist").get();
         EXPECT_FALSE(result.ok()) << "Expected error for nonexistent key";
         // 404 or NoSuchKey — exact code depends on AwsS3ObjectStore mapping
         EXPECT_TRUE(result.status_code == 404 || !result.error_message.empty())
