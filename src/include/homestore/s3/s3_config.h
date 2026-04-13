@@ -61,6 +61,17 @@ struct S3Config {
 
     static uint32_t dirty_cache_max_mb() { return HS_DYNAMIC_CONFIG(s3.dirty_cache_max_mb); }
 
+    static std::string eviction_policy() {
+        auto v = std::string{HS_DYNAMIC_CONFIG(s3.eviction_policy)};
+        return v.empty() ? "lru" : v;
+    }
+
+    static float nvme_capacity_threshold() { return HS_DYNAMIC_CONFIG(s3.nvme_capacity_threshold); }
+
+    static uint32_t eviction_cooldown_secs() { return HS_DYNAMIC_CONFIG(s3.eviction_cooldown_secs); }
+
+    static uint32_t eviction_monitor_interval_secs() { return HS_DYNAMIC_CONFIG(s3.eviction_monitor_interval_secs); }
+
     /// Validate config at startup. Throws on invalid configuration.
     static void validate() {
         if (!is_enabled()) return; // nothing to validate if disabled
@@ -76,10 +87,19 @@ struct S3Config {
 
         if (dirty_cache_max_mb() == 0) { throw std::invalid_argument("s3.dirty_cache_max_mb must be > 0"); }
 
+        auto policy = eviction_policy();
+        if (policy != "lru") { throw std::invalid_argument("s3.eviction_policy must be 'lru', got: " + policy); }
+
+        auto threshold = nvme_capacity_threshold();
+        if (threshold <= 0.0f || threshold > 1.0f) {
+            throw std::invalid_argument("s3.nvme_capacity_threshold must be in (0.0, 1.0]");
+        }
+
         LOGINFO("S3 config validated: bucket={} region={} endpoint={} backend={} upload_concurrency={} "
-                "retry_count={} retry_backoff_ms={} dirty_cache_max_mb={}",
+                "retry_count={} retry_backoff_ms={} dirty_cache_max_mb={} eviction_policy={} "
+                "nvme_capacity_threshold={:.2f} eviction_cooldown_secs={} eviction_monitor_interval_secs={}",
                 bucket_name(), region(), endpoint(), backend, upload_concurrency(), retry_count(), retry_backoff_ms(),
-                dirty_cache_max_mb());
+                dirty_cache_max_mb(), policy, threshold, eviction_cooldown_secs(), eviction_monitor_interval_secs());
     }
 
     /// Produce an S3ObjectStoreConfig from the validated settings.
