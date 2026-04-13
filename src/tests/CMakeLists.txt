@@ -199,6 +199,30 @@ endif()
     target_link_libraries(test_on_demand_recovery homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME OnDemandRecovery COMMAND test_on_demand_recovery)
 
+    # Integration tests — Group 2: Tiered Read Path
+    add_executable(test_s3_integ_tiered_read)
+    target_sources(test_s3_integ_tiered_read PRIVATE test_s3_integ_tiered_read.cpp)
+    target_link_libraries(test_s3_integ_tiered_read homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3IntegTieredRead COMMAND test_s3_integ_tiered_read)
+
+    # Integration tests — Group 4: On-Demand Recovery + Hydration
+    add_executable(test_s3_integ_ondemand_recovery)
+    target_sources(test_s3_integ_ondemand_recovery PRIVATE test_s3_integ_ondemand_recovery.cpp)
+    target_link_libraries(test_s3_integ_ondemand_recovery homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3IntegOnDemandRecovery COMMAND test_s3_integ_ondemand_recovery)
+
+    # Integration tests — Group 5: Eviction + Hydration Lifecycle
+    add_executable(test_s3_integ_eviction_lifecycle)
+    target_sources(test_s3_integ_eviction_lifecycle PRIVATE test_s3_integ_eviction_lifecycle.cpp)
+    target_link_libraries(test_s3_integ_eviction_lifecycle homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3IntegEvictionLifecycle COMMAND test_s3_integ_eviction_lifecycle)
+
+    # Integration tests — Group 6: LRU Eviction Policy
+    add_executable(test_s3_integ_lru_policy)
+    target_sources(test_s3_integ_lru_policy PRIVATE test_s3_integ_lru_policy.cpp)
+    target_link_libraries(test_s3_integ_lru_policy homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3IntegLruPolicy COMMAND test_s3_integ_lru_policy)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)
