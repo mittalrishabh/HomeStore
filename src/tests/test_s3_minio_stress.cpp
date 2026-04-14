@@ -27,6 +27,10 @@
 
 #include <atomic>
 #include <chrono>
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#include <folly/init/Init.h>
+#pragma GCC diagnostic pop
 #include <cstring>
 #include <deque>
 #include <memory>
@@ -83,7 +87,7 @@ static S3ObjectStoreConfig make_minio_config(const std::string& bucket) {
     S3ObjectStoreConfig cfg;
     cfg.bucket = bucket;
     cfg.region = MINIO_REGION;
-    cfg.endpoint = MINIO_ENDPOINT;
+    cfg.endpoint = std::getenv("S3_ENDPOINT") ? std::getenv("S3_ENDPOINT") : MINIO_ENDPOINT;
     cfg.retry_count = 3;
     cfg.retry_backoff_ms = 100;
     return cfg;
@@ -119,12 +123,12 @@ public:
         std::lock_guard lock{m_mtx};
         auto it = m_chunks.find(chunk_id);
         if (it == m_chunks.end()) {
-            return {{.status_code = 404, .error_message = "Not on NVMe"}, {}};
+            return {{.status_code = 404, .error_message = "Not on NVMe", .content_length = 0, .etag = {}, .exists = false}, {}};
         }
         auto copy = sisl::make_byte_array(static_cast< uint32_t >(chunk_size), 0);
         auto sz = std::min(static_cast< uint64_t >(it->second->size()), chunk_size);
         std::memcpy(copy->bytes(), it->second->cbytes(), sz);
-        return {{.status_code = 0}, std::move(copy)};
+        return {{.status_code = 0, .error_message = {}, .content_length = 0, .etag = {}, .exists = false}, std::move(copy)};
     }
 
 private:
@@ -210,7 +214,8 @@ private:
 class MockNvmeChunkAllocator : public NvmeChunkAllocator {
 public:
     std::error_code allocate_nvme_chunk(chunk_id_t, uint64_t) override { return {}; }
-    void free_nvme_chunk(chunk_id_t) override {}
+    void release_nvme_chunk(chunk_id_t, uint64_t) override {}
+    uint64_t free_nvme_space_bytes() const override { return 1ULL << 30; }
 };
 
 class MockNvmeRecoveryWriter : public NvmeRecoveryWriter {
@@ -253,6 +258,14 @@ public:
 
 private:
     std::atomic< uint32_t > m_triggered{0};
+};
+
+class TestCP : public CP {
+public:
+    TestCP() : CP{nullptr} {
+        m_cp_id = 1;
+        m_cp_status.store(cp_status_t::cp_flushing);
+    }
 };
 
 ///////////////////////////////////////////////////////////////////////////////
@@ -304,6 +317,14 @@ protected:
         }
     }
 
+    bool run_cp_flush(S3CpCallbacks& cp_callbacks) {
+        auto cur_cp = std::make_unique< TestCP >();
+        auto new_cp = std::make_unique< TestCP >();
+        auto ctx_ptr = cp_callbacks.on_switchover_cp(cur_cp.get(), new_cp.get());
+        new_cp->set_context(cp_consumer_t::S3_SVC, std::move(ctx_ptr));
+        return cp_callbacks.cp_flush(new_cp.get()).get();
+    }
+
     std::string m_volume_id;
     S3KeyMapper m_key_mapper;
     std::shared_ptr< S3ObjectStore > m_s3_store;
@@ -343,7 +364,7 @@ TEST_F(S3MinioStressTest, ConcurrentChunkUploads) {
             for (int i = 0; i < CHUNKS_PER_THREAD; ++i) {
                 int idx = t * CHUNKS_PER_THREAD + i;
                 auto cid = all_chunks[idx].id;
-                auto result = m_chunk_store->put(cid, TEST_CHUNK_SIZE, {}).get();
+                auto result = m_chunk_store->put(cid, std::vector< DirtyBlock >{}, TEST_CHUNK_SIZE);
                 if (result.ok()) {
                     success_count.fetch_add(1);
                 } else {
@@ -400,15 +421,10 @@ TEST_F(S3MinioStressTest, RapidCpFlushCycles) {
                                          static_cast< uint8_t >(cycle * 10 + c.id));
             m_nvme_reader->set_chunk_data(c.id, c.data);
 
-            pdev.write(c.id, 0,
-                       std::make_shared< sisl::byte_array_impl >(
-                           c.data->bytes(), static_cast< uint32_t >(TEST_CHUNK_SIZE), false));
+            pdev.write(c.id, 0, c.data);
         }
 
-        auto ctx = cp_callbacks.on_switchover_cp(nullptr, nullptr);
-        ASSERT_NE(ctx, nullptr) << "switchover failed at cycle " << cycle;
-
-        auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
+        auto flush_ok = run_cp_flush(cp_callbacks);
         EXPECT_TRUE(flush_ok) << "CP flush failed at cycle " << cycle;
     }
 
@@ -452,7 +468,7 @@ TEST_F(S3MinioStressTest, ConcurrentReadsAndWrites) {
 
     // Initial upload so readers have something to read
     for (const auto& c : chunks) {
-        auto result = m_chunk_store->put(c.id, TEST_CHUNK_SIZE, {}).get();
+        auto result = m_chunk_store->put(c.id, std::vector< DirtyBlock >{}, TEST_CHUNK_SIZE);
         ASSERT_TRUE(result.ok()) << "Initial upload failed for chunk " << c.id;
     }
 
@@ -475,7 +491,7 @@ TEST_F(S3MinioStressTest, ConcurrentReadsAndWrites) {
                 auto new_data = make_patterned_data(static_cast< uint32_t >(TEST_CHUNK_SIZE),
                                                     static_cast< uint8_t >(t * 100 + w));
                 m_nvme_reader->set_chunk_data(cid, new_data);
-                auto result = m_chunk_store->put(cid, TEST_CHUNK_SIZE, {}).get();
+                auto result = m_chunk_store->put(cid, std::vector< DirtyBlock >{}, TEST_CHUNK_SIZE);
                 if (result.ok()) { write_ok.fetch_add(1); }
             }
         });
@@ -586,13 +602,10 @@ TEST_F(S3MinioStressTest, RecoveryAfterMultipleCpCycles) {
             c.data = make_patterned_data(static_cast< uint32_t >(TEST_CHUNK_SIZE),
                                          static_cast< uint8_t >(cycle * 20 + c.id));
             m_nvme_reader->set_chunk_data(c.id, c.data);
-            pdev.write(c.id, 0,
-                       std::make_shared< sisl::byte_array_impl >(
-                           c.data->bytes(), static_cast< uint32_t >(TEST_CHUNK_SIZE), false));
+            pdev.write(c.id, 0, c.data);
         }
 
-        cp_callbacks.on_switchover_cp(nullptr, nullptr);
-        auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
+        auto flush_ok = run_cp_flush(cp_callbacks);
         ASSERT_TRUE(flush_ok) << "CP flush failed at cycle " << cycle;
     }
 
@@ -647,9 +660,7 @@ TEST_F(S3MinioStressTest, ManyChunksFlushAtOnce) {
 
     // Dirty all chunks
     for (const auto& c : chunks) {
-        pdev.write(c.id, 0,
-                   std::make_shared< sisl::byte_array_impl >(
-                       c.data->bytes(), static_cast< uint32_t >(TEST_CHUNK_SIZE), false));
+        pdev.write(c.id, 0, c.data);
     }
 
     std::vector< S3PhysicalDev* > pdevs = {&pdev};
@@ -657,8 +668,7 @@ TEST_F(S3MinioStressTest, ManyChunksFlushAtOnce) {
 
     auto start = std::chrono::steady_clock::now();
 
-    cp_callbacks.on_switchover_cp(nullptr, nullptr);
-    auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
+    auto flush_ok = run_cp_flush(cp_callbacks);
 
     auto elapsed_ms = std::chrono::duration_cast< std::chrono::milliseconds >(
                           std::chrono::steady_clock::now() - start)
@@ -698,7 +708,7 @@ TEST_F(S3MinioStressTest, CpFlushWithConcurrentReads) {
 
     // Do initial upload
     for (const auto& c : chunks) {
-        auto result = m_chunk_store->put(c.id, TEST_CHUNK_SIZE, {}).get();
+        auto result = m_chunk_store->put(c.id, std::vector< DirtyBlock >{}, TEST_CHUNK_SIZE);
         ASSERT_TRUE(result.ok());
     }
 
@@ -727,15 +737,12 @@ TEST_F(S3MinioStressTest, CpFlushWithConcurrentReads) {
         c.data = make_patterned_data(static_cast< uint32_t >(TEST_CHUNK_SIZE),
                                      static_cast< uint8_t >(c.id + 100));
         m_nvme_reader->set_chunk_data(c.id, c.data);
-        pdev.write(c.id, 0,
-                   std::make_shared< sisl::byte_array_impl >(
-                       c.data->bytes(), static_cast< uint32_t >(TEST_CHUNK_SIZE), false));
+        pdev.write(c.id, 0, c.data);
     }
 
     std::vector< S3PhysicalDev* > pdevs = {&pdev};
     S3CpCallbacks cp_callbacks(pdevs);
-    cp_callbacks.on_switchover_cp(nullptr, nullptr);
-    auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
+    auto flush_ok = run_cp_flush(cp_callbacks);
     flush_done.store(true);
     EXPECT_TRUE(flush_ok);
 
@@ -776,14 +783,11 @@ TEST_F(S3MinioStressTest, FullPipelineLifecycle) {
             c.data = make_patterned_data(static_cast< uint32_t >(TEST_CHUNK_SIZE),
                                          static_cast< uint8_t >(cycle * 30 + c.id));
             m_nvme_reader->set_chunk_data(c.id, c.data);
-            pdev.write(c.id, 0,
-                       std::make_shared< sisl::byte_array_impl >(
-                           c.data->bytes(), static_cast< uint32_t >(TEST_CHUNK_SIZE), false));
+            pdev.write(c.id, 0, c.data);
         }
 
         // Phase 2: CP flush
-        cp_callbacks.on_switchover_cp(nullptr, nullptr);
-        auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
+        auto flush_ok = run_cp_flush(cp_callbacks);
         ASSERT_TRUE(flush_ok) << "CP flush failed at cycle " << cycle;
 
         // Phase 3: Verify reads match
@@ -854,9 +858,7 @@ TEST_F(S3MinioStressTest, MultiplePdevsConcurrentFlush) {
                                             static_cast< uint8_t >(p * 10 + i));
             pd->create_chunk(cid, TEST_CHUNK_SIZE, S3ChunkType::DATA, 0);
             nvme->set_chunk_data(cid, data);
-            pd->write(cid, 0,
-                      std::make_shared< sisl::byte_array_impl >(
-                          data->bytes(), static_cast< uint32_t >(TEST_CHUNK_SIZE), false));
+            pd->write(cid, 0, data);
             chunks.push_back({cid, S3ChunkType::DATA, data});
         }
 
@@ -871,8 +873,7 @@ TEST_F(S3MinioStressTest, MultiplePdevsConcurrentFlush) {
     for (auto& pd : pdevs) { pdev_ptrs.push_back(pd.get()); }
 
     S3CpCallbacks cp_callbacks(pdev_ptrs);
-    cp_callbacks.on_switchover_cp(nullptr, nullptr);
-    auto flush_ok = cp_callbacks.cp_flush(nullptr).get();
+    auto flush_ok = run_cp_flush(cp_callbacks);
     EXPECT_TRUE(flush_ok);
 
     // Verify each pdev's superblock exists
@@ -895,6 +896,7 @@ int main(int argc, char* argv[]) {
     SISL_OPTIONS_LOAD(argc, argv, logging);
     sisl::logging::SetLogger("test_s3_minio_stress");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
+    folly::Init follyInit(&argc, &argv);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();
 }

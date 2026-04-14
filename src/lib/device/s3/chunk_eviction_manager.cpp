@@ -154,7 +154,7 @@ bool ChunkEvictionManager::is_chunk_evicted(chunk_id_t chunk_id) const {
 }
 
 void ChunkEvictionManager::mark_hydrated(chunk_id_t chunk_id) {
-    auto* state = find_state(chunk_id);
+    auto* state = find_state_mut(chunk_id);
     if (!state) return;
 
     std::unique_lock lock{state->mtx};

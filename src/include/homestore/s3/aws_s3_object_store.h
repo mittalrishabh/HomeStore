@@ -55,8 +55,9 @@ private:
 
     static S3Result outcome_to_result(const Aws::S3::S3Error& error);
 
-    static std::once_flag s_init_flag;
-    static std::atomic< int > s_ref_count;
+    static std::mutex s_sdk_mutex;
+    static int s_ref_count;
+    static bool s_sdk_initialized;
     static Aws::SDKOptions s_sdk_options;
 
     S3ObjectStoreConfig m_cfg;

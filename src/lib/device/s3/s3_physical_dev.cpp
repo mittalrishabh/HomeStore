@@ -70,7 +70,7 @@ void S3PhysicalDev::write(chunk_id_t chunk_id, offset_t offset, const sisl::byte
 
     COUNTER_INCREMENT(m_metrics, s3_write_count, 1);
     COUNTER_INCREMENT(m_metrics, s3_dirty_cache_inserts, 1);
-    COUNTER_SET(m_metrics, s3_dirty_cache_bytes, m_dirty_cache_bytes.load());
+    // TODO: GAUGE_UPDATE(m_metrics, s3_dirty_cache_bytes, m_dirty_cache_bytes.load());
 
     LOGTRACEMOD(s3, "S3PhysicalDev::write chunk_id={} offset={} size={} dirty_cache_total={}",
                 chunk_id, offset, data_size, m_dirty_cache_bytes.load());
@@ -146,7 +146,7 @@ void S3PhysicalDev::remove_chunk(chunk_id_t chunk_id) {
             }
             m_dirty_cache.erase(it);
             m_dirty_cache_bytes.fetch_sub(freed_bytes, std::memory_order_relaxed);
-            COUNTER_SET(m_metrics, s3_dirty_cache_bytes, m_dirty_cache_bytes.load());
+            // TODO: GAUGE_UPDATE(m_metrics, s3_dirty_cache_bytes, m_dirty_cache_bytes.load());
         }
     }
 
@@ -176,7 +176,7 @@ std::vector< DirtyBlock > S3PhysicalDev::drain_dirty_cache(chunk_id_t chunk_id) 
     m_dirty_cache_bytes.fetch_sub(drained_bytes, std::memory_order_relaxed);
 
     COUNTER_INCREMENT(m_metrics, s3_dirty_cache_drains, 1);
-    COUNTER_SET(m_metrics, s3_dirty_cache_bytes, m_dirty_cache_bytes.load());
+    // TODO: GAUGE_UPDATE(m_metrics, s3_dirty_cache_bytes, m_dirty_cache_bytes.load());
 
     LOGDEBUGMOD(s3, "S3PhysicalDev::drain_dirty_cache chunk_id={} drained {} blocks ({} bytes)",
                 chunk_id, blocks.size(), drained_bytes);
@@ -190,7 +190,7 @@ std::map< chunk_id_t, std::vector< DirtyBlock > > S3PhysicalDev::drain_all_dirty
     // Note: moved-from map is in a valid empty state; no .clear() needed.
     m_dirty_cache_bytes.store(0, std::memory_order_relaxed);
 
-    COUNTER_SET(m_metrics, s3_dirty_cache_bytes, 0);
+    // TODO: GAUGE_UPDATE(m_metrics, s3_dirty_cache_bytes, 0);
 
     uint64_t total_blocks = 0;
     for (const auto& [cid, blocks] : all_blocks) {
@@ -235,7 +235,7 @@ S3Result S3PhysicalDev::load_superblock() {
     LOGDEBUGMOD(s3, "S3PhysicalDev::load_superblock pdev_id={} volume_id={}", m_pdev_id, m_volume_id);
 
     auto result = m_superblock.read_from_s3(*m_s3_store, m_volume_id);
-    if (result) {
+    if (result.ok()) {
         LOGDEBUGMOD(s3, "Loaded superblock: pdev_id={} gen={} num_chunks={}",
                     m_superblock.pdev_id(), m_superblock.generation(), m_superblock.num_chunks());
     }

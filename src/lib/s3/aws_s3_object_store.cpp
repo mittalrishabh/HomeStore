@@ -18,6 +18,8 @@
 #include <thread>
 
 #include <aws/core/auth/AWSCredentialsProvider.h>
+#include <aws/core/client/DefaultRetryStrategy.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
 #include <aws/core/utils/HashingUtils.h>
 #include <aws/core/utils/memory/stl/AWSStringStream.h>
 #include <aws/s3/model/CopyObjectRequest.h>
@@ -34,13 +36,20 @@
 
 namespace homestore {
 
-std::once_flag AwsS3ObjectStore::s_init_flag;
-std::atomic< int > AwsS3ObjectStore::s_ref_count{0};
+std::mutex AwsS3ObjectStore::s_sdk_mutex;
+int AwsS3ObjectStore::s_ref_count{0};
+bool AwsS3ObjectStore::s_sdk_initialized{false};
 Aws::SDKOptions AwsS3ObjectStore::s_sdk_options;
 
 AwsS3ObjectStore::AwsS3ObjectStore(const S3ObjectStoreConfig& cfg) : m_cfg{cfg} {
-    std::call_once(s_init_flag, [] { Aws::InitAPI(s_sdk_options); });
-    s_ref_count.fetch_add(1, std::memory_order_acq_rel);
+    {
+        std::lock_guard lock{s_sdk_mutex};
+        if (!s_sdk_initialized) {
+            Aws::InitAPI(s_sdk_options);
+            s_sdk_initialized = true;
+        }
+        ++s_ref_count;
+    }
 
     Aws::Client::ClientConfiguration client_cfg;
     client_cfg.region = Aws::String(m_cfg.region.begin(), m_cfg.region.end());
@@ -51,28 +60,26 @@ AwsS3ObjectStore::AwsS3ObjectStore(const S3ObjectStoreConfig& cfg) : m_cfg{cfg} 
 
     client_cfg.connectTimeoutMs = 5000;
     client_cfg.requestTimeoutMs = 30000;
-    client_cfg.retryStrategy = nullptr; // we do our own retries
+    client_cfg.retryStrategy = std::make_shared< Aws::Client::DefaultRetryStrategy >(0, 0);
 
     const bool use_path_style = !m_cfg.endpoint.empty();
 
     m_client = std::make_shared< Aws::S3::S3Client >(
-        Aws::MakeShared< Aws::Auth::DefaultAWSCredentialsProviderChain >("AwsS3ObjectStore"),
         client_cfg,
         Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never,
-        use_path_style);
+        !use_path_style);
 
     m_executor = std::make_unique< folly::CPUThreadPoolExecutor >(4);
 
     LOGINFO("AwsS3ObjectStore created bucket={} region={} endpoint={} path_style={}",
-            m_cfg.bucket, m_cfg.region, m_cfg.endpoint, use_path_style);
+            m_cfg.bucket, m_cfg.region, m_cfg.endpoint, !use_path_style);
 }
 
 AwsS3ObjectStore::~AwsS3ObjectStore() {
     m_executor.reset();
     m_client.reset();
-    if (s_ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
-        Aws::ShutdownAPI(s_sdk_options);
-    }
+    std::lock_guard lock{s_sdk_mutex};
+    --s_ref_count;
 }
 
 template < typename Func >
