@@ -17,8 +17,6 @@
 #include <homestore/s3/nvme_superblock_fallback.h>
 #include <homestore/crc.h>
 
-SISL_LOGGING_INIT(s3)
-
 namespace homestore {
 
 // ─── Construction ────────────────────────────────────────────────────────────
@@ -45,7 +43,7 @@ uint64_t NvmeSuperblockManager::compute_crc(const nvme_sb_slot_header& hdr,
     nvme_sb_slot_header tmp = hdr;
     tmp.checksum = 0;
 
-    uint32_t crc = crc32_ieee(init_crc32, reinterpret_cast< const unsigned char* >(&tmp), sizeof(tmp));
+    uint32_t crc = crc32_ieee(0, reinterpret_cast< const unsigned char* >(&tmp), sizeof(tmp));
     if (payload && payload_size > 0) {
         crc = crc32_ieee(crc, reinterpret_cast< const unsigned char* >(payload), payload_size);
     }
