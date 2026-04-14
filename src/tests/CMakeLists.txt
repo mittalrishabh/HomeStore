@@ -199,6 +199,12 @@ endif()
     target_link_libraries(test_snapshot_manager homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME SnapshotManager COMMAND test_snapshot_manager)
 
+    # Snapshot Reader — Snapshot Read tests (Task 4.2)
+    add_executable(test_snapshot_reader)
+    target_sources(test_snapshot_reader PRIVATE test_snapshot_reader.cpp)
+    target_link_libraries(test_snapshot_reader homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME SnapshotReader COMMAND test_snapshot_reader)
+
     # On-Demand Recovery — Fast Startup tests (Task 3.3)
     add_executable(test_on_demand_recovery)
     target_sources(test_on_demand_recovery PRIVATE test_on_demand_recovery.cpp)
