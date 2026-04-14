@@ -205,6 +205,12 @@ endif()
     target_link_libraries(test_snapshot_reader homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME SnapshotReader COMMAND test_snapshot_reader)
 
+    # S3 GC — Intermediate CP Object Cleanup tests (Task 4.3)
+    add_executable(test_s3_gc)
+    target_sources(test_s3_gc PRIVATE test_s3_gc.cpp)
+    target_link_libraries(test_s3_gc homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3GC COMMAND test_s3_gc)
+
     # On-Demand Recovery — Fast Startup tests (Task 3.3)
     add_executable(test_on_demand_recovery)
     target_sources(test_on_demand_recovery PRIVATE test_on_demand_recovery.cpp)
