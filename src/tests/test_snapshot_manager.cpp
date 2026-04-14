@@ -120,7 +120,7 @@ protected:
         auto cp_cb = [this]() -> bool { return m_cp_flush_success; };
 
         m_snap_mgr = std::make_unique< SnapshotManager >(
-            m_s3_pdev.get(), m_chunk_store.get(), cp_cb);
+            m_s3_pdev.get(), m_chunk_store.get(), cp_cb, m_s3_store);
     }
 
     std::string m_volume_id{"vol-snap-test"};
@@ -248,20 +248,23 @@ TEST_F(SnapshotManagerTest, DeleteSnapshotSucceeds) {
     m_snap_mgr->create_snapshot(100);
     ASSERT_EQ(m_s3_pdev->superblock().num_snapshots(), 1u);
 
-    ASSERT_TRUE(m_snap_mgr->delete_snapshot(100));
+    auto result = m_snap_mgr->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
     EXPECT_EQ(m_s3_pdev->superblock().num_snapshots(), 0u);
     EXPECT_EQ(m_s3_pdev->superblock().find_snapshot(100), nullptr);
 }
 
-TEST_F(SnapshotManagerTest, DeleteNonexistentSnapshotReturnsFalse) {
-    EXPECT_FALSE(m_snap_mgr->delete_snapshot(999));
+TEST_F(SnapshotManagerTest, DeleteNonexistentSnapshotFails) {
+    auto result = m_snap_mgr->delete_snapshot(999);
+    EXPECT_FALSE(result.success);
 }
 
 TEST_F(SnapshotManagerTest, DeleteLastSnapshotRevertsToOverwriteMode) {
     m_snap_mgr->create_snapshot(100);
     EXPECT_GT(m_chunk_store->active_generation(), 0u);
 
-    m_snap_mgr->delete_snapshot(100);
+    auto result = m_snap_mgr->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
     EXPECT_EQ(m_chunk_store->active_generation(), 0u);
 
     // Chunk entries should revert to non-generation keys
@@ -276,7 +279,8 @@ TEST_F(SnapshotManagerTest, DeleteOneOfTwoSnapshotsKeepsGenerationMode) {
     m_snap_mgr->create_snapshot(100);
     m_snap_mgr->create_snapshot(200);
 
-    m_snap_mgr->delete_snapshot(100);
+    auto result = m_snap_mgr->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
     EXPECT_EQ(m_s3_pdev->superblock().num_snapshots(), 1u);
     EXPECT_GT(m_chunk_store->active_generation(), 0u);
 }
@@ -315,6 +319,134 @@ TEST_F(SnapshotManagerTest, SuperblockRoundTripMultipleSnapshots) {
     EXPECT_NE(deserialized.find_snapshot(200), nullptr);
     EXPECT_EQ(deserialized.find_snapshot(100)->header.btree_root_blkid, 0xAAu);
     EXPECT_EQ(deserialized.find_snapshot(200)->header.btree_root_blkid, 0xBBu);
+}
+
+TEST_F(SnapshotManagerTest, DeleteSnapshotCleansUnreferencedS3Keys) {
+    // Upload chunk data to S3 so snapshot pinned keys exist as real objects
+    for (const auto& chunk : m_s3_pdev->superblock().chunks()) {
+        auto blob = sisl::io_blob_safe{64};
+        std::memset(blob.bytes(), 0xCC, 64);
+        m_s3_store->put_object(chunk.get_s3_key(), std::move(blob)).get();
+    }
+
+    m_snap_mgr->create_snapshot(100);
+
+    // After snapshot, the pinned keys (gen=0) are now old objects in S3.
+    // The live chunk entries point to gen-stamped keys.
+    // Upload the new gen-stamped keys to simulate a CP flush.
+    for (const auto& chunk : m_s3_pdev->superblock().chunks()) {
+        auto blob = sisl::io_blob_safe{64};
+        std::memset(blob.bytes(), 0xDD, 64);
+        m_s3_store->put_object(chunk.get_s3_key(), std::move(blob)).get();
+    }
+
+    // The original (gen=0) keys are only pinned by snapshot 100.
+    // Deleting snapshot 100 should clean them up.
+    auto result = m_snap_mgr->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.s3_keys_cleaned, 4u);
+
+    // Verify the old keys are gone
+    for (uint64_t cid : {1, 2, 10, 11}) {
+        auto old_key = m_key_mapper.chunk_data_key(static_cast< chunk_id_t >(cid), 0);
+        EXPECT_FALSE(m_s3_store->has_object(old_key)) << "key should be deleted: " << old_key;
+    }
+}
+
+TEST_F(SnapshotManagerTest, DeleteSnapshotRetainsKeysPinnedByOtherSnapshot) {
+    // Upload chunk data
+    for (const auto& chunk : m_s3_pdev->superblock().chunks()) {
+        auto blob = sisl::io_blob_safe{64};
+        std::memset(blob.bytes(), 0xCC, 64);
+        m_s3_store->put_object(chunk.get_s3_key(), std::move(blob)).get();
+    }
+
+    m_snap_mgr->create_snapshot(100);
+
+    // Upload gen-stamped keys for the first snapshot's generation
+    for (const auto& chunk : m_s3_pdev->superblock().chunks()) {
+        auto blob = sisl::io_blob_safe{64};
+        std::memset(blob.bytes(), 0xDD, 64);
+        m_s3_store->put_object(chunk.get_s3_key(), std::move(blob)).get();
+    }
+
+    m_snap_mgr->create_snapshot(200);
+
+    // Now snapshot 100 pins gen=0 keys, snapshot 200 pins gen=6 keys.
+    // Deleting snapshot 100 should clean gen=0 keys (not pinned by 200).
+    auto result = m_snap_mgr->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.s3_keys_cleaned, 4u);
+
+    // Snapshot 200's pinned keys should still exist
+    auto* snap200 = m_s3_pdev->superblock().find_snapshot(200);
+    ASSERT_NE(snap200, nullptr);
+    for (const auto& ck : snap200->chunk_keys) {
+        EXPECT_TRUE(m_s3_store->has_object(ck.get_s3_key()))
+            << "key should be retained: " << ck.get_s3_key();
+    }
+}
+
+TEST_F(SnapshotManagerTest, DeleteSnapshotRetainsLiveChunkKeys) {
+    // Upload chunk data
+    for (const auto& chunk : m_s3_pdev->superblock().chunks()) {
+        auto blob = sisl::io_blob_safe{64};
+        std::memset(blob.bytes(), 0xCC, 64);
+        m_s3_store->put_object(chunk.get_s3_key(), std::move(blob)).get();
+    }
+
+    // Create snapshot — this pins gen=0 keys and switches to gen=6
+    m_snap_mgr->create_snapshot(100);
+
+    // DON'T upload gen-stamped keys — the live chunk entries point to them
+    // but they don't exist in S3 yet. The pinned gen=0 keys ARE the live
+    // chunk keys from before the snapshot (same as what's pinned).
+    // Actually, let's create a scenario where pinned == live:
+    // After snapshot, live chunk keys are gen-stamped. If we don't do another
+    // CP, the gen=0 keys are the only real data. But they're also the pinned keys.
+    // Let's verify that if a pinned key matches a live chunk key, it's retained.
+
+    // For this test: manually set a chunk entry back to a pinned key to simulate
+    // the scenario where a live key overlaps with a pinned key.
+    // This is contrived but tests the still_pinned logic for live chunks.
+    auto& sb = m_s3_pdev->superblock_mutable();
+    auto* snap = sb.find_snapshot(100);
+    ASSERT_NE(snap, nullptr);
+
+    // Get one of the pinned keys
+    auto pinned_key = snap->chunk_keys[0].get_s3_key();
+    auto pinned_cid = snap->chunk_keys[0].chunk_id;
+
+    // Set the live chunk entry to the same key (as if no CP happened for this chunk)
+    for (auto& chunk : sb.chunks_mutable()) {
+        if (chunk.chunk_id == pinned_cid) {
+            chunk.set_s3_key(pinned_key);
+            break;
+        }
+    }
+
+    auto result = m_snap_mgr->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
+
+    // The pinned key that matches the live chunk entry should NOT be deleted
+    EXPECT_TRUE(m_s3_store->has_object(pinned_key))
+        << "live chunk key should be retained: " << pinned_key;
+
+    // The other 3 pinned keys should be cleaned (they don't match any live key)
+    EXPECT_EQ(result.s3_keys_cleaned, 3u);
+}
+
+TEST_F(SnapshotManagerTest, DeleteSnapshotWithNoS3StoreSkipsCleanup) {
+    auto cp_cb = [this]() -> bool { return m_cp_flush_success; };
+    auto mgr_no_s3 = std::make_unique< SnapshotManager >(
+        m_s3_pdev.get(), m_chunk_store.get(), cp_cb);
+
+    mgr_no_s3->create_snapshot(100);
+
+    auto result = mgr_no_s3->delete_snapshot(100);
+    ASSERT_TRUE(result.success);
+    EXPECT_EQ(result.s3_keys_cleaned, 0u);
+    EXPECT_EQ(m_s3_pdev->superblock().num_snapshots(), 0u);
 }
 
 TEST_F(SnapshotManagerTest, V1SuperblockDeserializesWithZeroSnapshots) {
