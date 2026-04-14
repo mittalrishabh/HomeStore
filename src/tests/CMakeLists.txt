@@ -254,6 +254,12 @@ endif()
         target_link_libraries(test_s3_minio_smoke homestore $<TARGET_OBJECTS:hs_s3_aws> ${COMMON_TEST_DEPS} GTest::gmock ${AWSSDK_LINK_LIBRARIES})
         add_test(NAME S3MinioSmoke COMMAND test_s3_minio_smoke)
         set_tests_properties(S3MinioSmoke PROPERTIES TIMEOUT 120)
+
+        add_executable(test_s3_minio_stress)
+        target_sources(test_s3_minio_stress PRIVATE test_s3_minio_stress.cpp)
+        target_link_libraries(test_s3_minio_stress homestore $<TARGET_OBJECTS:hs_s3_aws> ${COMMON_TEST_DEPS} GTest::gmock ${AWSSDK_LINK_LIBRARIES})
+        add_test(NAME S3MinioStress COMMAND test_s3_minio_stress)
+        set_tests_properties(S3MinioStress PROPERTIES TIMEOUT 600)
     endif()
 
     # Integration tests — Groups 1, 3, 7: CP Flow, Bulk Recovery, Cross-Concern Integrity
