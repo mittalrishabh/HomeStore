@@ -14,5 +14,6 @@ if (ENABLE_MINIO_TESTS)
     target_sources(hs_s3_aws PRIVATE
         aws_s3_object_store.cpp
     )
+    target_include_directories(hs_s3_aws PRIVATE ${AWSSDK_INCLUDE_DIRS})
     target_link_libraries(hs_s3_aws hs_common ${COMMON_DEPS} ${AWSSDK_LINK_LIBRARIES})
 endif()
