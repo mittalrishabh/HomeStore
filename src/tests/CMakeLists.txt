@@ -211,6 +211,13 @@ endif()
     target_link_libraries(test_s3_gc homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME S3GC COMMAND test_s3_gc)
 
+    # Snapshot Stress — Full lifecycle stress/load tests (Phase 4)
+    add_executable(test_snapshot_stress)
+    target_sources(test_snapshot_stress PRIVATE test_snapshot_stress.cpp)
+    target_link_libraries(test_snapshot_stress homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME SnapshotStress COMMAND test_snapshot_stress)
+    set_tests_properties(SnapshotStress PROPERTIES TIMEOUT 300)
+
     # On-Demand Recovery — Fast Startup tests (Task 3.3)
     add_executable(test_on_demand_recovery)
     target_sources(test_on_demand_recovery PRIVATE test_on_demand_recovery.cpp)
