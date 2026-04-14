@@ -63,7 +63,11 @@
 #include <homestore/s3/s3_physical_dev.h>
 #include <homestore/s3/s3_recovery.h>
 #include <homestore/s3/tiered_read_handler.h>
-#include "lib/s3/s3_object_store_impl.h"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#include <folly/init/Init.h>
+#pragma GCC diagnostic pop
+#include "s3/s3_object_store_impl.h"
 
 SISL_LOGGING_INIT(s3)
 SISL_OPTIONS_ENABLE(logging)
@@ -201,12 +205,12 @@ public:
         std::lock_guard lock{m_mtx};
         auto it = m_chunks.find(chunk_id);
         if (it == m_chunks.end()) {
-            return {{.status_code = 404, .error_message = "Not on NVMe"}, {}};
+            return {{.status_code = 404, .error_message = "Not on NVMe", .content_length = 0, .etag = {}, .exists = false}, {}};
         }
         auto copy = sisl::make_byte_array(static_cast< uint32_t >(chunk_size), 0);
         auto sz = std::min(static_cast< uint64_t >(it->second->size()), chunk_size);
         std::memcpy(copy->bytes(), it->second->cbytes(), sz);
-        return {{.status_code = 0}, std::move(copy)};
+        return {{.status_code = 0, .error_message = {}, .content_length = 0, .etag = {}, .exists = false}, std::move(copy)};
     }
 
 private:
@@ -624,7 +628,7 @@ TEST_F(S3CoreStressTest, ConcurrentWritesPlusCpFlush) {
             << "Chunk " << (base_chunk_id + i) << " must be on S3 after final flush";
     }
 
-    SISL_LOG_INFO("Scenario 1 complete: {} writes, {} CPs, final gen={}",
+    LOGINFOMOD(s3,"Scenario 1 complete: {} writes, {} CPs, final gen={}",
                   total_writes.load(), total_cps.load(), m_s3_pdev->superblock().generation());
 }
 
@@ -717,7 +721,7 @@ TEST_F(S3CoreStressTest, ConcurrentTieredReadsDuringEvictionHydration) {
     EXPECT_GT(total_hydrations.load(), 0u);
     EXPECT_GT(total_evictions.load(), 0u);
 
-    SISL_LOG_INFO("Scenario 2 complete: {} reads, {} hydrations, {} evictions",
+    LOGINFOMOD(s3,"Scenario 2 complete: {} reads, {} hydrations, {} evictions",
                   total_reads.load(), total_hydrations.load(), total_evictions.load());
 }
 
@@ -798,7 +802,7 @@ TEST_F(S3CoreStressTest, DirtyCachePressureForcesEarlyCp) {
         << "Small dirty cache should have triggered at least one early CP";
     EXPECT_GT(total_writes.load(), 0u);
 
-    SISL_LOG_INFO("Scenario 3 complete: {} writes, {} early CP triggers, final dirty_cache={}B",
+    LOGINFOMOD(s3,"Scenario 3 complete: {} writes, {} early CP triggers, final dirty_cache={}B",
                   total_writes.load(), early_cp_counter->count(),
                   small_pdev->dirty_cache_size_bytes());
 }
@@ -883,7 +887,7 @@ TEST_F(S3CoreStressTest, LruEvictionChurnUnderContinuousWrites) {
     EXPECT_GT(total_writes.load(), 0u);
     EXPECT_GT(total_accesses.load(), 0u);
 
-    SISL_LOG_INFO("Scenario 4 complete: {} writes, {} accesses, {} chunks evicted out of {}",
+    LOGINFOMOD(s3,"Scenario 4 complete: {} writes, {} accesses, {} chunks evicted out of {}",
                   total_writes.load(), total_accesses.load(), evicted_count, g_num_chunks);
 }
 
@@ -971,7 +975,7 @@ TEST_F(S3CoreStressTest, RecoveryAfterCrashDuringCp) {
         ASSERT_GT(recovered_data->size(), 0u);
     }
 
-    SISL_LOG_INFO("Scenario 5 complete: recovered {} chunks at gen {}, "
+    LOGINFOMOD(s3,"Scenario 5 complete: recovered {} chunks at gen {}, "
                   "total bytes={}",
                   result.chunks_recovered, recovered_sb.generation(),
                   result.total_bytes);
@@ -1032,7 +1036,7 @@ TEST_F(S3CoreStressTest, ConcurrentWritesCrashRecoveryIntegrity) {
     EXPECT_EQ(result.chunks_recovered, recovery_chunks);
     EXPECT_EQ(recovery_mgr.superblock().generation(), gen);
 
-    SISL_LOG_INFO("Scenario 5b complete: {} writes during CP, recovered {} chunks at gen {}",
+    LOGINFOMOD(s3,"Scenario 5b complete: {} writes during CP, recovered {} chunks at gen {}",
                   writes.load(), result.chunks_recovered, gen);
 }
 
@@ -1042,6 +1046,7 @@ TEST_F(S3CoreStressTest, ConcurrentWritesCrashRecoveryIntegrity) {
 
 int main(int argc, char* argv[]) {
     ::testing::InitGoogleTest(&argc, argv);
+    folly::Init follyInit(&argc, &argv);
     SISL_OPTIONS_LOAD(argc, argv, logging);
     sisl::logging::SetLogger("test_s3_core_stress");
     spdlog::set_pattern("[%D %T%z] [%^%l%$] [%n] [%t] %v");
@@ -1059,7 +1064,7 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    SISL_LOG_INFO("S3 Core Stress Test configuration: threads={}, chunks={}, "
+    LOGINFOMOD(s3,"S3 Core Stress Test configuration: threads={}, chunks={}, "
                   "chunk_size={}, duration={}s",
                   g_num_threads, g_num_chunks, g_chunk_size, g_stress_duration_secs);
 

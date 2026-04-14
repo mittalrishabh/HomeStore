@@ -180,4 +180,11 @@ const ChunkEvictionManager::ChunkState* ChunkEvictionManager::find_state(chunk_i
     return it->second.get();
 }
 
+ChunkEvictionManager::ChunkState* ChunkEvictionManager::find_state_mut(chunk_id_t chunk_id) {
+    std::lock_guard lock{m_states_mutex};
+    auto it = m_chunk_states.find(chunk_id);
+    if (it == m_chunk_states.end()) return nullptr;
+    return it->second.get();
+}
+
 } // namespace homestore

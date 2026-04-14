@@ -161,6 +161,7 @@ private:
 
     ChunkState& get_or_create_state(chunk_id_t chunk_id);
     const ChunkState* find_state(chunk_id_t chunk_id) const;
+    ChunkState* find_state_mut(chunk_id_t chunk_id);
 
     S3PhysicalDev* m_s3_pdev;
     std::shared_ptr< NvmeChunkManager > m_nvme_mgr;
