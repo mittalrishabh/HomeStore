@@ -61,6 +61,30 @@ std::vector< const s3_chunk_entry* > PdevS3Superblock::get_chunks_by_type(S3Chun
     return result;
 }
 
+bool PdevS3Superblock::remove_snapshot(uint64_t snap_id) {
+    auto it = std::remove_if(m_snapshots.begin(), m_snapshots.end(),
+                             [snap_id](const SnapshotRecord& s) { return s.header.snap_id == snap_id; });
+    if (it == m_snapshots.end()) return false;
+    m_snapshots.erase(it, m_snapshots.end());
+    return true;
+}
+
+const PdevS3Superblock::SnapshotRecord* PdevS3Superblock::find_snapshot(uint64_t snap_id) const {
+    for (const auto& snap : m_snapshots) {
+        if (snap.header.snap_id == snap_id) return &snap;
+    }
+    return nullptr;
+}
+
+uint64_t PdevS3Superblock::serialized_size() const {
+    uint64_t size = sizeof(pdev_s3_sb_header) + m_chunks.size() * sizeof(s3_chunk_entry);
+    for (const auto& snap : m_snapshots) {
+        size += sizeof(s3_snapshot_entry);
+        size += snap.chunk_keys.size() * sizeof(s3_snapshot_chunk_key);
+    }
+    return size;
+}
+
 sisl::byte_array PdevS3Superblock::serialize() const {
     auto total_size = static_cast< uint32_t >(serialized_size());
     auto buf = sisl::make_byte_array(total_size, 0);
@@ -69,14 +93,28 @@ sisl::byte_array PdevS3Superblock::serialize() const {
     // Write header
     pdev_s3_sb_header hdr = m_header;
     hdr.num_chunks = static_cast< uint32_t >(m_chunks.size());
-    hdr.checksum = 0; // Zero checksum for computation
+    hdr.num_snapshots = static_cast< uint32_t >(m_snapshots.size());
+    hdr.checksum = 0;
     std::memcpy(raw, &hdr, sizeof(hdr));
 
     // Write chunk entries
-    auto* chunk_ptr = raw + sizeof(pdev_s3_sb_header);
+    auto* ptr = raw + sizeof(pdev_s3_sb_header);
     for (const auto& entry : m_chunks) {
-        std::memcpy(chunk_ptr, &entry, sizeof(s3_chunk_entry));
-        chunk_ptr += sizeof(s3_chunk_entry);
+        std::memcpy(ptr, &entry, sizeof(s3_chunk_entry));
+        ptr += sizeof(s3_chunk_entry);
+    }
+
+    // Write snapshot entries: [s3_snapshot_entry][chunk_key_0][chunk_key_1]...
+    for (const auto& snap : m_snapshots) {
+        s3_snapshot_entry snap_hdr = snap.header;
+        snap_hdr.num_chunk_keys = static_cast< uint32_t >(snap.chunk_keys.size());
+        std::memcpy(ptr, &snap_hdr, sizeof(s3_snapshot_entry));
+        ptr += sizeof(s3_snapshot_entry);
+
+        for (const auto& ck : snap.chunk_keys) {
+            std::memcpy(ptr, &ck, sizeof(s3_snapshot_chunk_key));
+            ptr += sizeof(s3_snapshot_chunk_key);
+        }
     }
 
     // Compute and store checksum
@@ -114,18 +152,16 @@ bool PdevS3Superblock::deserialize(const sisl::byte_array& data) {
         return false;
     }
 
-    // Validate size consistency
-    uint64_t expected_size = sizeof(pdev_s3_sb_header) + m_header.num_chunks * sizeof(s3_chunk_entry);
-    if (total_size < expected_size) {
+    // Validate minimum size for chunks
+    uint64_t min_size = sizeof(pdev_s3_sb_header) + m_header.num_chunks * sizeof(s3_chunk_entry);
+    if (total_size < min_size) {
         LOGERRORMOD(s3, "PdevS3Superblock::deserialize: buffer too small for {} chunks ({} < {})",
-                    m_header.num_chunks, total_size, expected_size);
+                    m_header.num_chunks, total_size, min_size);
         return false;
     }
 
     // Validate checksum
     auto saved_checksum = m_header.checksum;
-
-    // Create a temp copy with checksum zeroed to recompute
     auto temp_buf = sisl::make_byte_array(static_cast< uint32_t >(total_size), 0);
     std::memcpy(temp_buf->bytes(), raw, total_size);
     auto* temp_hdr = reinterpret_cast< pdev_s3_sb_header* >(temp_buf->bytes());
@@ -141,14 +177,43 @@ bool PdevS3Superblock::deserialize(const sisl::byte_array& data) {
     // Read chunk entries
     m_chunks.clear();
     m_chunks.resize(m_header.num_chunks);
-    auto* chunk_ptr = raw + sizeof(pdev_s3_sb_header);
+    auto* ptr = raw + sizeof(pdev_s3_sb_header);
     for (uint32_t i = 0; i < m_header.num_chunks; ++i) {
-        std::memcpy(&m_chunks[i], chunk_ptr, sizeof(s3_chunk_entry));
-        chunk_ptr += sizeof(s3_chunk_entry);
+        std::memcpy(&m_chunks[i], ptr, sizeof(s3_chunk_entry));
+        ptr += sizeof(s3_chunk_entry);
     }
 
-    LOGDEBUGMOD(s3, "PdevS3Superblock::deserialize: pdev_id={} gen={} num_chunks={}",
-                m_header.pdev_id, m_header.generation, m_header.num_chunks);
+    // Read snapshot entries (v2+)
+    m_snapshots.clear();
+    uint32_t num_snaps = (m_header.version >= 2) ? m_header.num_snapshots : 0;
+    for (uint32_t i = 0; i < num_snaps; ++i) {
+        if (static_cast< uint64_t >(ptr - raw) + sizeof(s3_snapshot_entry) > total_size) {
+            LOGERRORMOD(s3, "PdevS3Superblock::deserialize: truncated snapshot entry {}", i);
+            return false;
+        }
+
+        SnapshotRecord snap;
+        std::memcpy(&snap.header, ptr, sizeof(s3_snapshot_entry));
+        ptr += sizeof(s3_snapshot_entry);
+
+        uint64_t keys_size = snap.header.num_chunk_keys * sizeof(s3_snapshot_chunk_key);
+        if (static_cast< uint64_t >(ptr - raw) + keys_size > total_size) {
+            LOGERRORMOD(s3, "PdevS3Superblock::deserialize: truncated snapshot chunk keys for snap_id={}",
+                        snap.header.snap_id);
+            return false;
+        }
+
+        snap.chunk_keys.resize(snap.header.num_chunk_keys);
+        for (uint32_t j = 0; j < snap.header.num_chunk_keys; ++j) {
+            std::memcpy(&snap.chunk_keys[j], ptr, sizeof(s3_snapshot_chunk_key));
+            ptr += sizeof(s3_snapshot_chunk_key);
+        }
+
+        m_snapshots.push_back(std::move(snap));
+    }
+
+    LOGDEBUGMOD(s3, "PdevS3Superblock::deserialize: pdev_id={} gen={} num_chunks={} num_snapshots={}",
+                m_header.pdev_id, m_header.generation, m_header.num_chunks, m_snapshots.size());
     return true;
 }
 
@@ -156,10 +221,9 @@ S3Result PdevS3Superblock::write_to_s3(S3ObjectStore& s3_store, const std::strin
     auto key = s3_key(volume_id);
     auto buf = serialize();
 
-    LOGDEBUGMOD(s3, "Writing pdev_s3 superblock to S3: key={} pdev_id={} gen={} num_chunks={} size={}",
-                key, m_header.pdev_id, m_header.generation, m_header.num_chunks, buf->size());
+    LOGDEBUGMOD(s3, "Writing pdev_s3 superblock to S3: key={} pdev_id={} gen={} num_chunks={} num_snapshots={} size={}",
+                key, m_header.pdev_id, m_header.generation, m_header.num_chunks, m_snapshots.size(), buf->size());
 
-    // Convert byte_array to io_blob_safe for the async API, then .get() to block
     sisl::io_blob_safe blob(buf->size(), 0);
     std::memcpy(blob.bytes(), buf->cbytes(), buf->size());
     auto result = s3_store.put_object(key, std::move(blob)).get();
@@ -180,7 +244,6 @@ S3Result PdevS3Superblock::read_from_s3(S3ObjectStore& s3_store, const std::stri
         return get_result;
     }
 
-    // Convert io_blob_safe to byte_array for deserialization
     auto data = sisl::make_byte_array(static_cast< uint32_t >(blob.size()), 0);
     std::memcpy(data->bytes(), blob.cbytes(), blob.size());
 
@@ -191,16 +254,14 @@ S3Result PdevS3Superblock::read_from_s3(S3ObjectStore& s3_store, const std::stri
         return err;
     }
 
-    LOGDEBUGMOD(s3, "Loaded pdev_s3 superblock: pdev_id={} gen={} num_chunks={}",
-                m_header.pdev_id, m_header.generation, num_chunks());
+    LOGDEBUGMOD(s3, "Loaded pdev_s3 superblock: pdev_id={} gen={} num_chunks={} num_snapshots={}",
+                m_header.pdev_id, m_header.generation, num_chunks(), m_snapshots.size());
     S3Result ok;
     ok.status_code = 0;
     return ok;
 }
 
 uint64_t PdevS3Superblock::compute_checksum(const uint8_t* data, uint64_t size) {
-    // Use HomeStore's standard CRC-32C.
-    // Feed in UINT32_MAX-sized chunks to avoid truncation if size > 4GB.
     uint32_t crc = init_crc32;
     uint64_t remaining = size;
     const uint8_t* ptr = data;
