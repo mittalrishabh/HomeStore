@@ -14,6 +14,7 @@
  *********************************************************************************/
 
 #include <chrono>
+#include <unordered_set>
 
 #include <homestore/s3/snapshot_manager.h>
 
@@ -34,10 +35,12 @@ std::string to_string(SnapshotResult r) {
 
 SnapshotManager::SnapshotManager(S3PhysicalDev* s3_pdev,
                                  FullChunkStore* chunk_store,
-                                 CpFlushCallback cp_flush_cb)
+                                 CpFlushCallback cp_flush_cb,
+                                 std::shared_ptr< S3ObjectStore > s3_store)
     : m_s3_pdev{s3_pdev},
       m_chunk_store{chunk_store},
-      m_cp_flush_cb{std::move(cp_flush_cb)} {}
+      m_cp_flush_cb{std::move(cp_flush_cb)},
+      m_s3_store{std::move(s3_store)} {}
 
 CreateSnapshotResult SnapshotManager::create_snapshot(uint64_t snap_id, uint64_t btree_root_blkid) {
     auto start = std::chrono::steady_clock::now();
@@ -118,15 +121,73 @@ CreateSnapshotResult SnapshotManager::create_snapshot(uint64_t snap_id, uint64_t
     return result;
 }
 
-bool SnapshotManager::delete_snapshot(uint64_t snap_id) {
+DeleteSnapshotResult SnapshotManager::delete_snapshot(uint64_t snap_id) {
+    DeleteSnapshotResult result;
     auto& sb = m_s3_pdev->superblock_mutable();
 
-    if (!sb.remove_snapshot(snap_id)) {
+    // Step 1: Collect the snapshot's pinned S3 keys before removing
+    auto* snap = sb.find_snapshot(snap_id);
+    if (!snap) {
         LOGWARNMOD(s3, "Snapshot {} not found for deletion", snap_id);
-        return false;
+        return result;
     }
 
-    // If no snapshots remain, revert to overwrite naming
+    std::vector< std::string > snap_keys;
+    snap_keys.reserve(snap->chunk_keys.size());
+    for (const auto& ck : snap->chunk_keys) {
+        snap_keys.push_back(ck.get_s3_key());
+    }
+
+    // Step 2: Remove snapshot from superblock
+    sb.remove_snapshot(snap_id);
+
+    // Step 3: Determine which of the snapshot's keys are no longer pinned
+    // by any remaining snapshot and delete them from S3
+    if (m_s3_store && !snap_keys.empty()) {
+        // Build pinned set from remaining snapshots
+        std::unordered_set< std::string > still_pinned;
+        for (const auto& remaining_snap : sb.snapshots()) {
+            for (const auto& ck : remaining_snap.chunk_keys) {
+                still_pinned.insert(ck.get_s3_key());
+            }
+        }
+
+        // Also keep keys that are currently live (in chunk entries)
+        for (const auto& chunk : sb.chunks()) {
+            still_pinned.insert(chunk.get_s3_key());
+        }
+
+        std::vector< std::string > to_delete;
+        for (const auto& key : snap_keys) {
+            if (still_pinned.count(key) == 0) {
+                to_delete.push_back(key);
+            }
+        }
+
+        if (!to_delete.empty()) {
+            LOGINFO("Snapshot {}: cleaning up {} unreferenced S3 keys", snap_id, to_delete.size());
+
+            auto del_result = m_s3_store->delete_objects(to_delete).get();
+            if (del_result.ok()) {
+                result.s3_keys_cleaned = to_delete.size();
+            } else {
+                LOGWARNMOD(s3, "Snapshot {}: batch delete failed, falling back to individual deletes: {}",
+                           snap_id, del_result.error_message);
+                for (const auto& key : to_delete) {
+                    auto r = m_s3_store->delete_object(key).get();
+                    if (r.ok()) {
+                        ++result.s3_keys_cleaned;
+                    } else {
+                        LOGERRORMOD(s3, "Snapshot {}: failed to delete S3 key {}: {}",
+                                    snap_id, key, r.error_message);
+                    }
+                }
+            }
+            COUNTER_INCREMENT(m_metrics, snapshot_s3_keys_cleaned, result.s3_keys_cleaned);
+        }
+    }
+
+    // Step 4: If no snapshots remain, revert to overwrite naming
     if (!sb.has_snapshots()) {
         m_chunk_store->set_active_generation(0);
 
@@ -135,8 +196,11 @@ bool SnapshotManager::delete_snapshot(uint64_t snap_id) {
             chunk.set_s3_key(mapper.chunk_data_key(chunk.chunk_id, 0));
             chunk.generation = 0;
         }
+
+        LOGINFO("Snapshot {}: no snapshots remain, reverted to overwrite naming", snap_id);
     }
 
+    // Step 5: Write updated superblock to S3
     auto sb_result = m_s3_pdev->write_superblock();
     if (!sb_result.ok()) {
         LOGERRORMOD(s3, "Snapshot {}: superblock write failed during deletion: {}",
@@ -144,8 +208,10 @@ bool SnapshotManager::delete_snapshot(uint64_t snap_id) {
     }
 
     COUNTER_INCREMENT(m_metrics, snapshots_deleted, 1);
-    LOGINFO("Snapshot {} deleted", snap_id);
-    return true;
+    LOGINFO("Snapshot {} deleted: {} S3 keys cleaned", snap_id, result.s3_keys_cleaned);
+
+    result.success = true;
+    return result;
 }
 
 } // namespace homestore

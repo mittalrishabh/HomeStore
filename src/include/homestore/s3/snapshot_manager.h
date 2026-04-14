@@ -24,6 +24,7 @@
 
 #include <homestore/s3/full_chunk_store.h>
 #include <homestore/s3/pdev_s3_superblock.h>
+#include <homestore/s3/s3_object_store.h>
 #include <homestore/s3/s3_physical_dev.h>
 
 namespace homestore {
@@ -53,6 +54,7 @@ public:
         REGISTER_COUNTER(snapshots_created, "Total snapshots created");
         REGISTER_COUNTER(snapshots_deleted, "Total snapshots deleted");
         REGISTER_COUNTER(snapshot_chunks_pinned, "Total chunk keys pinned by snapshots");
+        REGISTER_COUNTER(snapshot_s3_keys_cleaned, "S3 keys cleaned up during snapshot deletion");
 
         REGISTER_HISTOGRAM(snapshot_create_latency_us, "Snapshot creation latency in us",
                            HistogramBucketsType(OpLatecyBuckets));
@@ -77,11 +79,17 @@ public:
  * After snapshot creation, the pinned S3 objects are immutable — new
  * writes go to generation-stamped keys (data_gen<N>.dat).
  */
+struct DeleteSnapshotResult {
+    bool success{false};
+    uint64_t s3_keys_cleaned{0};
+};
+
 class SnapshotManager {
 public:
     SnapshotManager(S3PhysicalDev* s3_pdev,
                     FullChunkStore* chunk_store,
-                    CpFlushCallback cp_flush_cb);
+                    CpFlushCallback cp_flush_cb,
+                    std::shared_ptr< S3ObjectStore > s3_store = nullptr);
 
     ~SnapshotManager() = default;
 
@@ -98,13 +106,21 @@ public:
     CreateSnapshotResult create_snapshot(uint64_t snap_id, uint64_t btree_root_blkid = 0);
 
     /**
-     * @brief Delete a snapshot. After deletion, the pinned S3 objects may
-     *        be garbage-collected if no other snapshot references them.
+     * @brief Delete a snapshot and clean up its unreferenced S3 objects.
+     *
+     * 1. Collect the snapshot's pinned S3 keys
+     * 2. Remove the snapshot from the superblock
+     * 3. For each pinned key: if no remaining snapshot references it, delete from S3
+     * 4. If no snapshots remain: switch back to overwrite naming
+     * 5. Write updated superblock to S3
+     *
+     * S3 key cleanup requires an S3ObjectStore (set via constructor). If not
+     * set, deletion still removes metadata but skips S3 cleanup.
      *
      * @param snap_id  Snapshot to delete
-     * @return true if the snapshot existed and was deleted
+     * @return DeleteSnapshotResult with success status and cleanup count
      */
-    bool delete_snapshot(uint64_t snap_id);
+    DeleteSnapshotResult delete_snapshot(uint64_t snap_id);
 
     SnapshotMetrics& metrics() { return m_metrics; }
 
@@ -112,6 +128,7 @@ private:
     S3PhysicalDev* m_s3_pdev;
     FullChunkStore* m_chunk_store;
     CpFlushCallback m_cp_flush_cb;
+    std::shared_ptr< S3ObjectStore > m_s3_store;
     SnapshotMetrics m_metrics;
 };
 
