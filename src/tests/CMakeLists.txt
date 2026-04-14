@@ -268,6 +268,13 @@ endif()
     target_link_libraries(test_s3_integ_cp_recovery_integrity homestore ${COMMON_TEST_DEPS} GTest::gmock)
     add_test(NAME S3IntegCpRecoveryIntegrity COMMAND test_s3_integ_cp_recovery_integrity)
 
+    # S3 Core Stress Test — Phases 1-3 full lifecycle under concurrent pressure
+    add_executable(test_s3_core_stress)
+    target_sources(test_s3_core_stress PRIVATE test_s3_core_stress.cpp)
+    target_link_libraries(test_s3_core_stress homestore ${COMMON_TEST_DEPS} GTest::gmock)
+    add_test(NAME S3CoreStress COMMAND test_s3_core_stress)
+    set_tests_properties(S3CoreStress PROPERTIES TIMEOUT 300)
+
 is_non_coverage_build(non_coverage_build)
 if (${non_coverage_build})
     find_package(benchmark REQUIRED)
