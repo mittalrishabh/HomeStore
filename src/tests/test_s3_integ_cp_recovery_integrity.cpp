@@ -377,8 +377,6 @@ protected:
         m_callbacks = std::make_unique< S3CpCallbacks >(
             std::vector< S3PhysicalDev* >{m_s3_pdev.get()}, 2);
 
-        // Wire pdev to use callbacks as early-CP trigger
-        m_s3_pdev_with_cb.reset();
     }
 
     void create_chunk_with_data(chunk_id_t chunk_id, S3ChunkType type, uint8_t pattern) {
@@ -407,7 +405,6 @@ protected:
     std::shared_ptr< MockNvmeChunkReader > m_nvme_reader;
     std::shared_ptr< FullChunkStore > m_chunk_store;
     std::unique_ptr< S3PhysicalDev > m_s3_pdev;
-    std::unique_ptr< S3PhysicalDev > m_s3_pdev_with_cb;
     std::unique_ptr< S3CpCallbacks > m_callbacks;
 };
 
