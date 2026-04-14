@@ -22,5 +22,6 @@ target_sources(hs_device PRIVATE
       s3/eviction_policy.cpp
       s3/snapshot_manager.cpp
       s3/snapshot_reader.cpp
+      s3/s3_gc.cpp
     )
 target_link_libraries(hs_device hs_common ${COMMON_DEPS})
